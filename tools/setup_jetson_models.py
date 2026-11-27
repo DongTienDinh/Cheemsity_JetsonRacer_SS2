@@ -134,10 +134,12 @@ def verify_engine(config_rel):
     det = CnnLaneDetector(cfg)
     try:
         dummy = np.zeros((240, 320, 3), dtype=np.uint8)
+        det.process(dummy, need_aux=True, compute_bev=False)
+        has_3ch = det.last_white_mask is not None and det.last_road_mask is not None
         inf_times = []
         tot_times = []
-        for _ in range(30):
-            det.process(dummy)
+        for _ in range(40):
+            det.process(dummy, need_aux=False, compute_bev=False)
             inf_times.append(det.last_infer_ms)
             tot_times.append(det.last_total_ms)
         inf_p50 = float(np.percentile(np.array(inf_times), 50))
@@ -145,7 +147,6 @@ def verify_engine(config_rel):
         tot_p50 = float(np.percentile(np.array(tot_times), 50))
         tot_p95 = float(np.percentile(np.array(tot_times), 95))
         fps_p50 = 1000.0 / max(tot_p50, 1e-6)
-        has_3ch = det.last_white_mask is not None and det.last_road_mask is not None
         print('  [ OK ] Nap TensorRT OK | 3 kenh=%s | infer p50=%.2fms p95=%.2fms | '
               'tong p50=%.2fms p95=%.2fms (~%.1f FPS)'
               % ('CO' if has_3ch else 'KHONG', inf_p50, inf_p95, tot_p50, tot_p95, fps_p50))

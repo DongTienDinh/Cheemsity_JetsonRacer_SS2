@@ -2909,11 +2909,15 @@ def test_cnn_fast_path_vectorized_two_lines_and_lazy_preview_copy():
     engine.lane = det
     engine._dirty = False
     frame = np.full((240, 320, 3), 40, dtype=np.uint8)
-    r_no = engine.process(frame, 1.0 / 30.0, copy_preview=False)
-    assert r_no['lane'].found and r_no.get('two_lines_ok') is True
+    r_no = engine.process(frame, 1.0 / 30.0, copy_preview=False, need_aux=False)
+    assert r_no['lane'].found and r_no['lane'].debug is None
     assert '_preview_mask' not in r_no and '_preview_white' not in r_no
-    r_yes = engine.process(frame, 1.0 / 30.0, copy_preview=True)
+    r_yes = engine.process(frame, 1.0 / 30.0, copy_preview=True, need_aux=True)
+    assert r_yes['lane'].found and r_yes['lane'].debug is not None
+    assert r_yes.get('two_lines_ok') is True
     assert r_yes.get('_preview_mask') is not None and r_yes.get('_preview_white') is not None
+    # Kiem tra fit LUT tren duong nong khop voi ket qua khi bat BEV/aux
+    assert abs(r_no['lane'].cte - r_yes['lane'].cte) < 1e-6
 
 
 if __name__ == '__main__':

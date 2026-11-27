@@ -437,13 +437,17 @@ class LaneTuningEngine(object):
         return max(0.0, elapsed / self.soft_start_s)
 
     # ----------------------------------------------------------------- process
-    def process(self, frame_bgr, dt, now=None, copy_preview=True):
+    def process(self, frame_bgr, dt, now=None, copy_preview=True, need_aux=True):
         """Tra ve dict ket qua. KHONG gui lenh ra driver - do la viec cua UI."""
         if self._dirty:
             self.rebuild()
 
         proc = self.shading.apply_resized(frame_bgr, self.proc_size)
-        res = self.lane.process(proc)
+        if hasattr(self.lane, 'last_infer_ms'):
+            res = self.lane.process(
+                proc, need_aux=need_aux, compute_bev=copy_preview)
+        else:
+            res = self.lane.process(proc)
 
         err = ((1.0 - self.steer_look_w) * res.cte
                + self.steer_look_w * res.cte_lookahead)
@@ -1176,18 +1180,24 @@ class LaneTuningUI(object):
             dt = (1.0 / 30.0) if t_prev is None else max(1e-6, now_mono - t_prev)
             t_prev = now_mono
 
+            auto_running = (self._armed and self.mode == MODE_AUTO)
             preview_period = (
                 getattr(self, '_run_preview_period', self._preview_period)
-                if (self._armed and self.mode == MODE_AUTO)
+                if auto_running
                 else self._preview_period)
             want_preview = (
                 preview_period is not None and
                 (now_mono - last_preview) >= preview_period)
+            # Khi da bam CHAY (MODE_AUTO), cong 2-line khong con dung nua -> chi
+            # tinh 3 kenh + BEV o dung tick ve preview (1 Hz), con ~96% frame
+            # chay duong nong LUT sieu nhanh tren kenh centerline Ch2.
+            need_aux = (not auto_running) or want_preview
 
             try:
                 with self._engine_lock:
                     result = self.engine.process(
-                        frame, dt, now=now, copy_preview=want_preview)
+                        frame, dt, now=now, copy_preview=want_preview,
+                        need_aux=need_aux)
             except Exception as exc:
                 # Bao THAT TO. Truoc day chi ghi mot dong log duoi cung: vong
                 # lap break, panel dung im o khung hinh cuoi, va nguoi dung

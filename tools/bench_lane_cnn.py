@@ -152,16 +152,18 @@ def main():
 
     pre, inf, post, tot, found = [], [], [], [], 0
     for f in frames:
-        t0 = time.time()
+        t0 = time.perf_counter()
         x = det.preprocess(f)
-        t1 = time.time()
+        t1 = time.perf_counter()
         det.engine.infer(x)
-        t2 = time.time()
-        res = det.process(f)              # do lai ca vong, gom hau xu ly
-        t3 = time.time()
-        pre.append((t1 - t0) * 1e3)
-        inf.append((t2 - t1) * 1e3)
-        post.append((t3 - t2) * 1e3 - det.last_infer_ms - (t1 - t0) * 1e3)
+        t2 = time.perf_counter()
+        res = det.process(f, need_aux=False, compute_bev=False)
+        pre_ms = (t1 - t0) * 1e3
+        inf_ms = (t2 - t1) * 1e3
+        post_ms = max(0.0, det.last_total_ms - det.last_infer_ms - pre_ms)
+        pre.append(pre_ms)
+        inf.append(inf_ms)
+        post.append(post_ms)
         tot.append(det.last_total_ms)
         found += 1 if res.found else 0
 

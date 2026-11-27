@@ -346,7 +346,11 @@ class Runner(object):
                 # mau. Ghi tho co chu dich: con hieu chuan lai shading duoc tu
                 # video cu, con neu ghi anh da sua thi mat goc, khong lam lai duoc.
                 proc = self.shading.apply_resized(frame, self.proc_size)
-                lane_res = self.lane.process(proc)
+                if hasattr(self.lane, 'last_infer_ms'):
+                    lane_res = self.lane.process(
+                        proc, need_aux=False, compute_bev=False)
+                else:
+                    lane_res = self.lane.process(proc)
                 stop_res = self.stopline.process(proc) if self.task == 'smartcity' else None
                 moving, _ = self.motion.update(proc)
 
