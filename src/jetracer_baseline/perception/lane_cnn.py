@@ -370,6 +370,11 @@ class CnnLaneDetector(object):
         self._look = 0.0
         self._curv = 0.0
         self._init = False
+        self._road_start_streak = 0
+
+    @property
+    def road_start_ready(self):
+        return self._road_start_streak >= 5
 
     def reset(self):
         self._reset_state()
@@ -786,23 +791,22 @@ class CnnLaneDetector(object):
             return self._fit_values(co, t_max)
         return None
 
-    def _fit_road_guide(self, road_logits, preview):
-        ego_road = self._ego_road_bev(road_logits)
+    def _fit_road_guide(self, ego_road, preview):
         if ego_road is None:
-            return None, None
+            return None, None, False
         fit = self._fit_midpoints(ego_road, preview)
         raw = self._road_fit_values(ego_road, fit)
         if raw is not None:
-            return fit, raw
+            return fit, raw, True
         outside = self._bev_visible & (ego_road == 0)
         if np.count_nonzero(outside) < 70:
-            return None, None
+            return None, None, False
         fit = self._fit_inward_offset(ego_road, outside)
         raw = self._road_fit_values(ego_road, fit)
         if raw is not None:
             # Mot mep o xa cho huong ngam, khong du du lieu tinh CTE sat dau xe.
             raw = (0.0, raw[1], raw[2])
-        return fit, raw
+        return fit, raw, False
 
     def _road_turn_direction(self, fit, raw):
         if raw is None:
@@ -833,18 +837,25 @@ class CnnLaneDetector(object):
             self.n_disagree += 1
             raw = None
 
-        guide, guide_raw = self._fit_road_guide(road_logits, preview)
+        ego_road = self._ego_road_bev(road_logits)
+        # Vung Ch0 da cham gan xe va phai keo dai den dai thu ba phia truoc.
+        band_h = PROC_H // N_BANDS
+        road_seen = (ego_road is not None and
+                     np.count_nonzero(ego_road[-3 * band_h:-2 * band_h]) >= 10 * band_h)
+        self._road_start_streak = self._road_start_streak + 1 if road_seen else 0
+
+        guide, guide_raw, two_edges = self._fit_road_guide(ego_road, preview)
         self.last_road_turn = self._road_turn_direction(guide, guide_raw)
-        if self.last_road_turn:
-            wrong_way = (raw is not None and raw[1] * self.last_road_turn <= 0.0
-                         and abs(raw[1] - guide_raw[1]) >= 0.25)
-            if raw is None or wrong_way:
-                co, _, n_bands, npix, self.last_bev = guide
-                # Khong de feed-forward quay nguoc huong mep xanh da xac nhan.
-                curv = guide_raw[2] if guide_raw[2] * self.last_road_turn > 0.0 else 0.0
-                raw = (guide_raw[0], guide_raw[1], curv)
-                self.last_used_fallback = True
-                self.n_fallback += 1
+        wrong_way = (self.last_road_turn and raw is not None and
+                     raw[1] * self.last_road_turn <= 0.0 and
+                     abs(raw[1] - guide_raw[1]) >= 0.25)
+        if wrong_way or (raw is None and (self.last_road_turn or two_edges)):
+            co, _, n_bands, npix, self.last_bev = guide
+            # Khong de feed-forward quay nguoc huong mep xanh da xac nhan.
+            curv = 0.0 if guide_raw[2] * self.last_road_turn < 0.0 else guide_raw[2]
+            raw = (guide_raw[0], guide_raw[1], curv)
+            self.last_used_fallback = True
+            self.n_fallback += 1
 
         if preview:
             self.last_road_mask = (road_logits > 0.0).astype(np.uint8) * 255
@@ -917,6 +928,7 @@ class CnnLaneDetector(object):
             if seg.size != 3 * SEG_H * SEG_W:
                 raise ValueError('lane.cnn.road_guided can model Option B co Ch0 va Ch2')
             return self._process_road_guided(seg.reshape(3, SEG_H, SEG_W), reg, compute_bev, t0)
+        self._road_start_streak = 0
         seg3 = None
         # Nguong 0 tren logits == sigmoid > 0.5. Model co y khong co Sigmoid.
         if seg.size == 3 * SEG_H * SEG_W:

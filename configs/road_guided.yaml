@@ -2,3 +2,6 @@
 lane:
   cnn:
     road_guided: true
+
+control:
+  road_turn_steer_gain: 1.15

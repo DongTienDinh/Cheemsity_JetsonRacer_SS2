@@ -94,6 +94,7 @@ CONTROL_PARAMS = [
     ('control.curve_exit', 'Nguong RA cua', 0.02, 0.70, 0.01),
     ('control.curve_feedforward', 'Lai theo do cong', 0.0, 2.5, 0.05),
     ('control.corner_steer_gain', 'Boi lai khi cua', 1.0, 3.0, 0.05),
+    ('control.road_turn_steer_gain', 'Lai cua gat', 1.0, 1.50, 0.05),
     ('control.steer_max', 'Lai toi da (thang)', 0.10, 1.00, 0.05),
     ('control.corner_steer_max', 'Lai toi da (CUA)', 0.10, 1.00, 0.05),
     ('control.pid.kp', 'PID Kp', 0.0, 2.0, 0.05),
@@ -338,6 +339,8 @@ class LaneTuningEngine(object):
         # tuyen tinh trong `soft_start_s` giay dau.
         self.soft_start_s = 1.0
         self._run_t0 = None
+        self._motion_t0 = None
+        self._waiting_for_path = False
         self._dirty = True
         self.rebuild()
 
@@ -410,11 +413,14 @@ class LaneTuningEngine(object):
     def start_run(self, now=None):
         """Danh dau bat dau chay -> ga bat dau ramp tu 0."""
         self._run_t0 = time.time() if now is None else now
+        self._motion_t0 = self._run_t0
+        self._waiting_for_path = bool(getattr(self.lane, 'road_guided', False))
         self.pid.reset()
         self.corner.reset()
 
     def stop_run(self):
         self._run_t0 = None
+        self._waiting_for_path = False
 
     def close(self):
         lane = getattr(self, 'lane', None)
@@ -431,7 +437,7 @@ class LaneTuningEngine(object):
             return 1.0
         if self.soft_start_s <= 0:
             return 1.0
-        elapsed = (time.time() if now is None else now) - self._run_t0
+        elapsed = (time.time() if now is None else now) - self._motion_t0
         if elapsed >= self.soft_start_s:
             return 1.0
         return max(0.0, elapsed / self.soft_start_s)
@@ -451,11 +457,22 @@ class LaneTuningEngine(object):
 
         err = ((1.0 - self.steer_look_w) * res.cte
                + self.steer_look_w * res.cte_lookahead)
-        pid_out = self.pid.step(err, dt)
-        steer, throttle, mode = self.corner.step(
-            pid_out, res.cte, res.curvature, dt, lane_found=res.found)
-        ramp = self.soft_start_scale(now)
-        throttle *= ramp
+        road_turn = getattr(self.lane, 'last_road_turn', 0)
+        if not res.found or res.cte_lookahead * road_turn <= 0.0:
+            road_turn = 0
+        if self._waiting_for_path and res.found and self.lane.road_start_ready:
+            self._waiting_for_path = False
+            self._motion_t0 = time.time() if now is None else now
+        if self._waiting_for_path:
+            pid_out = steer = throttle = ramp = 0.0
+            mode = self.corner.mode
+        else:
+            pid_out = self.pid.step(err, dt)
+            steer, throttle, mode = self.corner.step(
+                pid_out, res.cte, res.curvature, dt, lane_found=res.found,
+                road_turn=road_turn)
+            ramp = self.soft_start_scale(now)
+            throttle *= ramp
 
         servo, servo_raw = servo_output_for(
             steer, self.drv_gain, self.drv_offset,
@@ -489,6 +506,8 @@ class LaneTuningEngine(object):
             result['used_fallback'] = bool(getattr(self.lane, 'last_used_fallback', False))
         if road_guided:
             result['road_guided'] = True
+            result['road_start_ready'] = self.lane.road_start_ready
+            result['waiting_for_path'] = self._waiting_for_path
             result['road_turn'] = self.lane.last_road_turn
             result['used_fallback'] = self.lane.last_used_fallback
         if copy_preview:
@@ -558,8 +577,10 @@ class LaneTuningEngine(object):
             _label(overlay, 'MAT DUONG (XANH) + TAM (VANG)' if road_guided
                    else 'CAMERA + 2 LINE (TIM) + TAM (VANG)')
             if road_guided and result.get('used_fallback'):
-                side = 'PHAI' if result.get('road_turn', 0) > 0 else 'TRAI'
-                tag_txt, tag_col = 'TAM TU MEP XANH - CUA %s' % side, (0, 220, 255)
+                tag_txt, tag_col = 'TAM TU MEP XANH', (0, 220, 255)
+                turn = result.get('road_turn', 0)
+                if turn:
+                    tag_txt += ' - CUA ' + ('PHAI' if turn > 0 else 'TRAI')
             elif result.get('used_fallback'):
                 tag_txt, tag_col = 'DANG DUNG TAM DU PHONG', (0, 220, 255)
             elif road_guided:
@@ -741,8 +762,9 @@ def _draw_banner(panel, res, result, fps, armed, driver_kind='dryrun',
         colour = (255, 160, 60)
     elif not armed:
         if result.get('road_guided'):
-            state, colour = (('CO TAM DUONG', (80, 235, 80)) if res.found else
-                             ('CHO TAM DUONG ON DINH', (0, 200, 255)))
+            state, colour = (('MAT DUONG OK - BAM CHAY', (80, 235, 80))
+                             if result.get('road_start_ready') else
+                             ('CHO VUNG XANH ON DINH', (0, 200, 255)))
         elif result.get('_preview_white') is not None:
             if result.get('two_lines_ok'):
                 state, colour = 'SAN SANG CHAY (2 LINE OK - bam CHAY)', (80, 235, 80)
@@ -752,6 +774,8 @@ def _draw_banner(panel, res, result, fps, armed, driver_kind='dryrun',
             state, colour = 'SAN SANG CHAY (CO VACH - bam CHAY)', (120, 220, 120)
         else:
             state, colour = 'DANG DUNG (dat xe vao 2 line roi bam CHAY)', (160, 160, 160)
+    elif result.get('waiting_for_path'):
+        state, colour = 'CHO HUONG LAI - GA 0', (0, 200, 255)
     elif not live:
         state, colour = 'DRYRUN - BANH KHONG QUAY', (0, 200, 255)
     elif ramp < 1.0:
@@ -2139,8 +2163,14 @@ class LaneTuningUI(object):
         #    - Option B (3 kenh): CHI yeu cau nhan du 2 VACH LINE 2 BEN (trai + phai)
         #      luc xuat phat. Khi da bam CHAY la chay thong theo phan vang (Ch2),
         #      khong kiem tra dieu kien 2 line nua.
-        #    - Mep xanh huong dan, CV, CNN 1 kenh cu: kiem tra mat tam 20 frame gan nhat.
-        if getattr(self.engine.lane, 'last_white_mask', None) is not None:
+        #    - Mep xanh huong dan: vung Ch0 noi toi xe on dinh qua 5 frame.
+        #    - CV / CNN 1 kenh cu: kiem tra mat tam 20 frame gan nhat.
+        if getattr(self.engine.lane, 'road_guided', False):
+            if not self.engine.lane.road_start_ready:
+                self._log('TU CHOI CHAY: cho vung mat duong xanh noi den xe on dinh qua 5 frame.')
+                self._set_status('TU CHOI CHAY - vung xanh chua on dinh')
+                return
+        elif getattr(self.engine.lane, 'last_white_mask', None) is not None:
             two_pct = self.engine.stats.recent_two_lines_pct(15)
             if two_pct < 60.0:
                 self._log('TU CHOI CHAY: chua nhan du 2 vach line 2 ben (%.0f%%/15 frame gan nhat). '
@@ -2330,6 +2360,9 @@ class LaneTuningUI(object):
         cua_som = w.FloatSlider(
             value=self._cfg_to_cua_som(g('control.curve_enter', 0.12)),
             min=0.0, max=1.0, step=0.05, description='CUA SOM', **L)
+        lai_cua_gat = w.FloatSlider(
+            value=float(g('control.road_turn_steer_gain', 1.0)),
+            min=1.0, max=1.50, step=0.05, description='LAI CUA GAT', **L)
         phanh = w.FloatSlider(
             value=self._cfg_to_phanh(g('control.curve_brake', 0.30)),
             min=0.0, max=1.0, step=0.05,
@@ -2340,7 +2373,7 @@ class LaneTuningUI(object):
             description='GOC LAI TOI DA', **L)
         # Moi num mot dong so RIENG ngay duoi. Doc dam, luon hien du cot hep.
         notes = dict((k, w.HTML()) for k in
-                     ('toc_do', 'toc_cua', 'cua_som', 'phanh', 'goc_lai'))
+                     ('toc_do', 'toc_cua', 'cua_som', 'lai_cua_gat', 'phanh', 'goc_lai'))
         info = w.HTML()
 
         def _n(html):
@@ -2369,6 +2402,9 @@ class LaneTuningUI(object):
                 'vao cua khi do cong &ge; <b>%.2f</b> &nbsp;|&nbsp; be lai som '
                 '<b>%.2f</b>' % (gp('control.curve_enter', 0),
                                  gp('control.curve_feedforward', 0)))
+            notes['lai_cua_gat'].value = _n(
+                'nhan lai <b>%.2fx</b> khi mep xanh va diem ngam cung huong'
+                % gp('control.road_turn_steer_gain', 1.0))
             notes['phanh'].value = _n(
                 'phanh theo do cong <b>%.2f</b> &nbsp;|&nbsp; theo do lech '
                 '<b>%.2f</b>' % (gp('control.curve_brake', 0),
@@ -2389,11 +2425,12 @@ class LaneTuningUI(object):
             info.value = ('<div style="margin-left:132px;font-size:11px">%s'
                           '</div>' % canh) if canh else ''
 
-        def mk(fn):
+        def mk(fn, update_speed_cap=True):
             def _h(change):
                 with self._engine_lock:
                     fn(float(change['new']))
-                    _cap_v_max()
+                    if update_speed_cap:
+                        _cap_v_max()
                 _refresh()
             return _h
 
@@ -2420,6 +2457,8 @@ class LaneTuningUI(object):
                        (cua_som, set_cua_som), (phanh, set_phanh),
                        (goc_lai, set_goc_lai)):
             sl.observe(mk(fn), names='value')
+        lai_cua_gat.observe(mk(lambda v: self.engine.set_param(
+            'control.road_turn_steer_gain', v), update_speed_cap=False), names='value')
         _refresh()
 
         huong_dan = w.HTML(
@@ -2442,6 +2481,7 @@ class LaneTuningUI(object):
         return w.VBox([toc_do, notes['toc_do'],
                        toc_cua, notes['toc_cua'],
                        cua_som, notes['cua_som'],
+                       lai_cua_gat, notes['lai_cua_gat'],
                        phanh, notes['phanh'],
                        goc_lai, notes['goc_lai'],
                        info, huong_dan])

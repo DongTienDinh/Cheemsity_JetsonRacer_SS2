@@ -1405,6 +1405,22 @@ def test_corner_controller_config_with_bad_hysteresis_is_repaired():
     assert ctrl.curve_exit < ctrl.curve_enter
 
 
+def test_confirmed_road_turn_boosts_steering_without_increasing_limits():
+    cfg = _cfg(control__road_turn_steer_gain=1.2, control__corner_steer_gain=1.6,
+               control__steer_max=0.6, control__corner_steer_max=0.6,
+               control__v_corner=0.12, control__v_straight=0.25,
+               control__v_max=0.30)
+    ctrl = CornerController(cfg)
+    straight = ctrl.step(0.25, 0.0, 0.0, 1.0)
+    assert straight == (0.25, 0.25, STRAIGHT)
+    right = ctrl.step(0.25, 0.0, 0.0, 1.0, road_turn=1)
+    assert abs(right[0] - 0.48) < 1e-6 and right[1:] == (0.12, CORNER)
+    left = ctrl.step(-0.25, 0.0, 0.0, 1.0, road_turn=-1)
+    assert abs(left[0] + 0.48) < 1e-6
+    assert abs(ctrl.step(-0.25, 0.0, 0.0, 1.0, road_turn=1)[0] + 0.40) < 1e-6
+    assert ctrl.step(0.9, 0.0, 0.0, 1.0, road_turn=1)[0] == 0.60
+
+
 def test_corner_controller_feedforward_steers_into_the_bend():
     """Cua hep can danh lai NGAY khi thay duong cong, khong doi CTE tang."""
     cfg = _corner_cfg(control__curve_feedforward=0.9,
@@ -2222,20 +2238,53 @@ def test_speed_track_ui_option_b_panel_and_recent_run_gate():
         ui._disarm_locked('stop')
         assert not ui._armed
 
-        # Mep xanh huong dan: yeu cau tam on dinh, doc lap voi trang thai 2 vach.
+        # Mep xanh huong dan: CHAY duoc khi chi co Ch0, cho huong lai moi cap ga.
         det.road_guided = True
         det._M_seg = np.diag([PROC_W / float(SEG_W), PROC_H / float(SEG_H), 1.0])
         det._build_bev_lut()
+
+        class FakeGreenEngine(object):
+            road = False
+            edges = False
+
+            def infer(self, _x):
+                seg = np.full((3, SEG_H, SEG_W), -5.0, dtype=np.float32)
+                seg[1] = 5.0  # Ch1 nhieu van bi bo qua.
+                if self.edges:
+                    seg[0, :, 34:94] = 5.0
+                elif self.road:
+                    seg[0] = 5.0  # Ch0 kin tam nhin, chua co huong lai.
+                return {'seg': seg, 'reg': np.zeros(3, dtype=np.float32)}
+
+        det.engine = FakeGreenEngine()
         engine.stats.reset()
         for _ in range(5):
             result = engine.process(frame, 1.0 / 30.0)
-        assert result['road_guided'] and result['lane'].found
-        assert result['_preview_road'].any() and result['_preview_mask'].any()
+        ui._on_run_locked()
+        assert not ui._armed and not result['road_start_ready']
+
+        det.engine.road = True
+        for _ in range(4):
+            result = engine.process(frame, 1.0 / 30.0)
+        ui._on_run_locked()
+        assert not ui._armed and not result['road_start_ready']
+        result = engine.process(frame, 1.0 / 30.0)
+        assert result['road_start_ready'] and not result['lane'].found
+        assert result['_preview_road'].any()
         assert '_preview_white' not in result
         panel = engine.render_panel(result, fps=30.0, armed=False, driver_kind='dryrun')
         assert panel.shape[2] == 3
         ui._on_run_locked()
         assert ui._armed and ui.mode == MODE_AUTO
+        now = engine._run_t0 + 2.0
+        waiting = engine.process(frame, 1.0 / 30.0, now=now)
+        assert waiting['waiting_for_path'] and waiting['throttle'] == 0.0
+        det.engine.edges = True
+        started = engine.process(frame, 1.0 / 30.0, now=now + 0.1)
+        assert started['lane'].found and started['used_fallback'] and started['_preview_mask'].any()
+        assert not started['waiting_for_path'] and started['ramp'] == 0.0
+        running = engine.process(frame, 1.0 / 30.0, now=now + 1.2)
+        assert running['throttle'] > 0.0
         ui._disarm_locked('stop')
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
