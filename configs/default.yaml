@@ -203,7 +203,7 @@ control:
   # Trên cua hẹp đây là khác biệt giữa bám được và cắt cua.
   curve_feedforward: 0.9
   corner_steer_gain: 1.6   # trong chế độ CUA nhân thêm vào lái để bẻ gần hết
-  road_turn_steer_gain: 1.0  # hệ số lái thêm khi mép xanh xác nhận hướng cua
+  road_turn_steer_gain: 1.15  # hệ số lái thêm khi mép xanh xác nhận hướng cua
   # Giới hạn tốc độ đổi ga: lên từ từ (bánh không trượt), xuống nhanh (thấy cua
   # là bỏ ga ngay).
   throttle_rise_rate: 0.8

@@ -325,13 +325,9 @@ class CnnLaneDetector(object):
         self.last_total_ms = 0.0
         self.last_mask = None        # mask ROI 256x128 dung de fit (centerline hoac fallback)
         self.last_road_mask = None   # Option B Ch0 (64x128) neu model 3 kenh
-        self.last_white_mask = None  # Option B Ch1 (64x128) neu model 3 kenh
-        self.last_center_mask = None # Option B Ch2 (64x128) neu model 3 kenh
-        self.last_left_line = False
-        self.last_right_line = False
-        self.last_two_lines_ok = False
         self.last_used_fallback = False
         self.last_road_turn = 0
+        self.road_guided = False
         self.last_bev = None         # cung mask do sau khi warp sang BEV
         self.n_disagree = 0
         self.n_fallback = 0
@@ -359,10 +355,6 @@ class CnnLaneDetector(object):
         # bao found=False de FSM ha ga / roi ve CV.
         self.reg_disagree = float(c('lane.cnn.reg_disagree', 0.35))
         self.check_reg = bool(c('lane.cnn.check_reg', True))
-        # Cac che do du phong Option B tu mat duong Ch0 va bien trang Ch1.
-        self.road_fallback = bool(c('lane.cnn.road_fallback', False))
-        self.road_guided = bool(c('lane.cnn.road_guided', False))
-        self.single_line_fallback = bool(c('lane.cnn.single_line_fallback', False))
         self.single_line_offset_px = float(c('lane.cnn.single_line_offset_px', 108.0))
 
     def _reset_state(self):
@@ -604,81 +596,6 @@ class CnnLaneDetector(object):
                 % dict((k, v.shape) for k, v in outs.items()))
         return seg, (None if reg is None else reg.ravel())
 
-    @staticmethod
-    def _sorted_median(xs):
-        """Trung vi chinh xac cua mang 1D da sap xep (flatnonzero) trong O(1)."""
-        n = len(xs)
-        mid = n >> 1
-        if n & 1:
-            return float(xs[mid])
-        return 0.5 * (float(xs[mid - 1]) + float(xs[mid]))
-
-    @staticmethod
-    def _check_two_lines(white_s, center_s, road_s):
-        """Kiem tra da nhan du 2 line trang ben trai + ben phai cua lan duong chua.
-
-        Vector hoa bang NumPy thay vi vong lap Python 48 hang (~3-5x nhanh hon tren ARM).
-        """
-        if white_s is None:
-            return False, False, False
-        y0 = SEG_H // 4
-        wb = white_s[y0:] > 0
-        w_any = wb.any(axis=1)
-        if not w_any.any():
-            return False, False, False
-        w_first = np.argmax(wb, axis=1).astype(np.float32)
-        w_last = (SEG_W - 1 - np.argmax(wb[:, ::-1], axis=1)).astype(np.float32)
-        ref_cx = np.where(
-            (w_last - w_first) >= 14.0,
-            0.5 * (w_first + w_last),
-            SEG_W * 0.5,
-        )
-        xs_seg = np.arange(SEG_W, dtype=np.float32)
-        if road_s is not None:
-            rb = road_s[y0:] > 0
-            r_cnt = rb.sum(axis=1)
-            r_ok = r_cnt >= 4
-            if r_ok.any():
-                ref_cx[r_ok] = (rb[r_ok] * xs_seg).sum(axis=1) / r_cnt[r_ok]
-        if center_s is not None:
-            cb = center_s[y0:] > 0
-            c_cnt = cb.sum(axis=1)
-            c_ok = c_cnt >= 1
-            if c_ok.any():
-                ref_cx[c_ok] = (cb[c_ok] * xs_seg).sum(axis=1) / c_cnt[c_ok]
-        left_rows = int(np.count_nonzero(w_any & (w_first < (ref_cx - 4.0))))
-        right_rows = int(np.count_nonzero(w_any & (w_last > (ref_cx + 4.0))))
-        has_left = left_rows >= 4
-        has_right = right_rows >= 4
-        return has_left, has_right, (has_left and has_right)
-
-    @staticmethod
-    def _road_fallback_mask(road_s, white_s):
-        """Suy dai tam duong 64x128 tu mat duong (Ch0-Ch1) hoac giua 2 line trang (Ch1)."""
-        clean = None
-        if road_s is not None:
-            if white_s is not None:
-                clean = cv2.bitwise_and(road_s, cv2.bitwise_not(white_s))
-            else:
-                clean = road_s
-        fb = np.zeros((SEG_H, SEG_W), np.uint8)
-        med = CnnLaneDetector._sorted_median
-        for y in range(SEG_H):
-            cx = None
-            if clean is not None:
-                xs = np.flatnonzero(clean[y])
-                if len(xs) >= 4:
-                    cx = int(med(xs))
-            if cx is None and white_s is not None:
-                w_xs = np.flatnonzero(white_s[y])
-                if len(w_xs) >= 2 and (int(w_xs[-1]) - int(w_xs[0])) >= 14:
-                    cx = int(0.5 * (int(w_xs[0]) + int(w_xs[-1])))
-            if cx is not None:
-                x0 = max(0, cx - 2)
-                x1 = min(SEG_W, cx + 3)
-                fb[y, x0:x1] = 255
-        return fb
-
     def _ego_road_bev(self, road_logits):
         road = cv2.warpPerspective((road_logits > 0.0).astype(np.uint8), self._M_seg,
                                    (PROC_W, PROC_H), flags=cv2.INTER_NEAREST)
@@ -694,21 +611,6 @@ class CnnLaneDetector(object):
         outlines = cv2.findContours(ego_road, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
         cv2.drawContours(ego_road, outlines, -1, 1, cv2.FILLED)
         return ego_road
-
-    def _white_road_edge_bev(self, white_logits, ego_road):
-        white = cv2.warpPerspective((white_logits > 0.405465).astype(np.uint8), self._M_seg,
-                                    (PROC_W, PROC_H), flags=cv2.INTER_NEAREST)  # sigmoid > 0.60
-        rim = cv2.morphologyEx(ego_road, cv2.MORPH_GRADIENT, self._edge_kernel) > 0
-        rim &= self._bev_visible
-        _, line_ids, stats, _ = cv2.connectedComponentsWithStats(white, connectivity=8)
-        touching = np.bincount(line_ids[rim], minlength=len(stats))
-        area = stats[:, cv2.CC_STAT_AREA]
-        span = np.maximum(stats[:, cv2.CC_STAT_WIDTH], stats[:, cv2.CC_STAT_HEIGHT])
-        supported = (area >= 25) & (span >= 24) & (touching >= 20) & (touching >= 0.18 * area)
-        lines = np.flatnonzero(supported[1:]) + 1
-        if len(lines) != 1:
-            return None
-        return (line_ids == lines[0]) & rim
 
     def _fit_inward_offset(self, ego_road, outside):
         # Duong cach deu o phia trong mat duong, ke ca khi mep cua gan nam ngang.
@@ -828,8 +730,6 @@ class CnnLaneDetector(object):
 
     def _process_road_guided(self, seg3, reg, preview, t0):
         road_logits, center_logits = seg3[0], seg3[2]
-        self.last_white_mask = self.last_center_mask = None
-        self.last_left_line = self.last_right_line = self.last_two_lines_ok = False
         self.last_road_mask = self.last_mask = self.last_bev = None
         co, t_max, n_bands, npix = self._mask_to_fit_lut(center_logits)
         raw = self._fit_values(co, t_max) if co is not None else None
@@ -871,45 +771,9 @@ class CnnLaneDetector(object):
             self.last_bev = None
         return self._finish_frame(raw, co, n_bands, npix, t0)
 
-    def _fit_recovery(self, ego_road, edge, reg_look):
-        if edge is None:
-            return None
-        fit = self._fit_inward_offset(ego_road, edge)
-        values = self._road_fit_values(ego_road, fit)
-        if values is None or values[1] * reg_look <= 0.0 or abs(values[1] - reg_look) > self.reg_disagree:
-            return None
-        return fit, values
-
-    def _recover_single_line(self, seg3, reg, raw, cte_disagree):
-        if reg is None or len(reg) < 2:
-            return None
-        reg_look = float(reg[1])
-        if not np.isfinite(reg_look) or abs(reg_look) < 0.20:
-            return None
-        look_disagree = (raw is not None and self.check_reg and raw[1] * reg_look <= 0.0
-                         and abs(raw[1] - reg_look) > self.reg_disagree)
-        if raw is not None and not (cte_disagree or look_disagree):
-            return None
-        ego_road = self._ego_road_bev(seg3[0])
-        if ego_road is None:
-            return None
-        outside = self._bev_visible & (ego_road == 0)
-        if np.count_nonzero(outside) >= 70:
-            recovery = self._fit_recovery(ego_road, outside, reg_look)
-            if recovery is not None:
-                return recovery
-        # Chi tham khao phan cua vach trang thuc su nam sat mep Ch0.
-        white_edge = self._white_road_edge_bev(seg3[1], ego_road)
-        return self._fit_recovery(ego_road, white_edge, reg_look)
-
     # ------------------------------------------------------------------ chay
     def process(self, frame_bgr, need_aux=True, compute_bev=False):
-        """Suy dien va fit duong tam.
-
-        - `need_aux=False`: khi Ch2 du tin cay, bo qua chuyen uint8 Ch0/Ch1
-          va _check_two_lines tren duong nong.
-        - `compute_bev=False`: chi chieu BEV khi can suy lai tu mat duong.
-        """
+        """Suy tam tu Ch0 va Ch2 cua Option B, hoac mask tam 1 kenh cu."""
         if self.engine is None:
             raise RuntimeError(
                 'lane.cnn.engine dang de rong - chi dung duoc hau xu ly. '
@@ -924,101 +788,26 @@ class CnnLaneDetector(object):
         seg, reg = self._pick_outputs(outs)
         self.last_used_fallback = False
         self.last_road_turn = 0
+        self.road_guided = seg.size == 3 * SEG_H * SEG_W
         if self.road_guided:
-            if seg.size != 3 * SEG_H * SEG_W:
-                raise ValueError('lane.cnn.road_guided can model Option B co Ch0 va Ch2')
             return self._process_road_guided(seg.reshape(3, SEG_H, SEG_W), reg, compute_bev, t0)
+
         self._road_start_streak = 0
-        seg3 = None
-        # Nguong 0 tren logits == sigmoid > 0.5. Model co y khong co Sigmoid.
-        if seg.size == 3 * SEG_H * SEG_W:
-            seg3 = seg.reshape(3, SEG_H, SEG_W)
-            if need_aux or compute_bev:
-                seg_bin = (seg3 > 0).astype(np.uint8) * 255
-                road_s = seg_bin[0]
-                white_s = seg_bin[1]
-                center_s = seg_bin[2]
-                self.last_road_mask = road_s
-                self.last_white_mask = white_s
-                self.last_center_mask = center_s
-                if need_aux:
-                    hl, hr, two_ok = self._check_two_lines(white_s, center_s, road_s)
-                    self.last_left_line = hl
-                    self.last_right_line = hr
-                    self.last_two_lines_ok = two_ok
-                self.last_mask = center_s
-                co, t_max, n_bands, npix = self._mask_to_fit_lut(center_s)
-                if compute_bev:
-                    self.last_bev = cv2.warpPerspective(
-                        center_s, self._M_seg, (PROC_W, PROC_H),
-                        flags=cv2.INTER_NEAREST)
-                else:
-                    self.last_bev = None
-            else:
-                co, t_max, n_bands, npix = self._mask_to_fit_lut(seg3[2])
-                self.last_bev = None
-
-            if co is None and self.road_fallback:
-                if not (need_aux or compute_bev):
-                    road_s = (seg3[0] > 0).astype(np.uint8) * 255
-                    white_s = (seg3[1] > 0).astype(np.uint8) * 255
-                    self.last_road_mask = road_s
-                    self.last_white_mask = white_s
-                fb_mask = self._road_fallback_mask(
-                    self.last_road_mask, self.last_white_mask)
-                co_fb, t_max_fb, n_bands_fb, npix_fb = self._mask_to_fit_lut(fb_mask)
-                if co_fb is not None:
-                    co, t_max, n_bands, npix = co_fb, t_max_fb, n_bands_fb, npix_fb
-                    self.last_mask = fb_mask
-                    if compute_bev:
-                        self.last_bev = cv2.warpPerspective(
-                            fb_mask, self._M_seg, (PROC_W, PROC_H),
-                            flags=cv2.INTER_NEAREST)
-                    self.last_used_fallback = True
-                    self.n_fallback += 1
-        else:
-            seg1 = seg.reshape(SEG_H, SEG_W)
-            self.last_road_mask = None
-            self.last_white_mask = None
-            self.last_center_mask = None
-            self.last_left_line = False
-            self.last_right_line = False
-            self.last_two_lines_ok = False
-            if compute_bev or need_aux:
-                raw_mask_s = (seg1 > 0).astype(np.uint8) * 255
-                self.last_mask = raw_mask_s
-                co, t_max, n_bands, npix = self._mask_to_fit_lut(raw_mask_s)
-                if compute_bev:
-                    self.last_bev = cv2.warpPerspective(
-                        raw_mask_s, self._M_seg, (PROC_W, PROC_H),
-                        flags=cv2.INTER_NEAREST)
-                else:
-                    self.last_bev = None
-            else:
-                co, t_max, n_bands, npix = self._mask_to_fit_lut(seg1)
-                self.last_bev = None
-
+        self.last_road_mask = None
+        self.last_bev = None
+        center = seg.reshape(SEG_H, SEG_W)
+        if compute_bev or need_aux:
+            center = (center > 0).astype(np.uint8) * 255
+            self.last_mask = center
+        if compute_bev:
+            self.last_bev = cv2.warpPerspective(
+                center, self._M_seg, (PROC_W, PROC_H), flags=cv2.INTER_NEAREST)
+        co, t_max, n_bands, npix = self._mask_to_fit_lut(center)
         raw = self._fit_values(co, t_max) if co is not None else None
-        cte_disagree = self._cte_disagrees(raw, reg)
-        if cte_disagree:
+        if self._cte_disagrees(raw, reg):
             self.n_disagree += 1
-
-        if self.single_line_fallback and seg3 is not None:
-            recovery = self._recover_single_line(seg3, reg, raw, cte_disagree)
-            if recovery is not None:
-                (co, _, n_bands, npix, fb_bev), raw = recovery
-                cte_disagree = False
-                if not self.last_used_fallback:
-                    self.n_fallback += 1
-                self.last_used_fallback = True
-                if need_aux or compute_bev:
-                    self.last_mask = cv2.warpPerspective(
-                        fb_bev, self._M_seg, (SEG_W, SEG_H),
-                        flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP)
-                if compute_bev:
-                    self.last_bev = fb_bev
-
-        return self._finish_frame(None if cte_disagree else raw, co, n_bands, npix, t0)
+            raw = None
+        return self._finish_frame(raw, co, n_bands, npix, t0)
 
     def _finish_frame(self, raw, co, n_bands, npix, t0):
         if raw is None:

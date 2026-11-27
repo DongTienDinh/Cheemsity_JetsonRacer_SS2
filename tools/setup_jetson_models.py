@@ -135,7 +135,7 @@ def verify_engine(config_rel):
     try:
         dummy = np.zeros((240, 320, 3), dtype=np.uint8)
         det.process(dummy, need_aux=True, compute_bev=False)
-        has_3ch = det.last_white_mask is not None and det.last_road_mask is not None
+        has_3ch = det.road_guided
         inf_times = []
         tot_times = []
         for _ in range(40):

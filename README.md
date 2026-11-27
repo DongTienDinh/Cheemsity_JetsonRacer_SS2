@@ -46,7 +46,7 @@ Repository mã nguồn và tài liệu triển khai cho **Jetson AI Racer Challe
    ```bash
    jupyter lab --ip=0.0.0.0 --no-browser
    ```
-   Bấm **1. MO CAMERA** → đặt xe vào giữa 2 line trắng (panel hiện 2 line tím + mặt đường xanh + tâm vàng và banner `SAN SANG CHAY (2 LINE OK)`) → bấm **2. CHAY - BAM LINE**.
+   Bấm **1. MO CAMERA**, đặt xe giữa làn và quan sát mặt đường xanh cùng tâm vàng. Khi hiện `MAT DUONG OK - BAM CHAY`, bấm **2. CHAY - BAM LINE**.
 
 **Trên laptop** (dev + test + phân tích log):
 ```bash

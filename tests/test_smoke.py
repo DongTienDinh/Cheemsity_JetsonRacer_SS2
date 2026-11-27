@@ -1902,8 +1902,8 @@ def test_live_runner_does_not_loop_forever_on_cached_eof_frame(tmpdir=None):
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def test_lane_cnn_supports_option_b_3channel_and_road_fallback():
-    """CnnLaneDetector phai ho tro ca 3 kenh Option B, road fallback va 1 kenh cu."""
+def test_lane_cnn_uses_green_and_yellow_by_default():
+    """Option B tu dung Ch0 va Ch2, model 1 kenh cu van hoat dong."""
     from jetracer_baseline.perception.lane_cnn import CnnLaneDetector, SEG_H, SEG_W
 
     for cfg_name, exp_engine in (
@@ -1930,6 +1930,7 @@ def test_lane_cnn_supports_option_b_3channel_and_road_fallback():
 
     cfg = load_config(CONFIG, [os.path.join(ROOT, 'configs', 'cnn_option_b.yaml')])
     cfg.set('lane.cnn.engine', '')
+    cfg.set('lane.cnn.road_guided', False)  # Config cu khong the bat lai Ch1.
     cfg.set('lane.cnn.check_reg', False)
     det = CnnLaneDetector(cfg)
     eng = FakeEngine()
@@ -1942,47 +1943,20 @@ def test_lane_cnn_supports_option_b_3channel_and_road_fallback():
     seg3[0, 2, 10:64, 78:84] = 5.0
     eng.seg = seg3
     eng.reg = np.array([[0.25, 0.25, 0.0]], dtype=np.float32)
-    res = det.process(frame)
+    res = det.process(frame, compute_bev=True)
     assert res.found
     assert res.cte > 0.05, 'centerline lech phai nhung cte=%.3f' % res.cte
     assert not det.last_used_fallback
-    assert det.last_road_mask is not None and det.last_center_mask is not None
+    assert det.road_guided and det.last_road_mask is not None and det.last_mask is not None
 
-    # 2. Mac dinh Option B chi bam DUNG phan vang (Ch2): khi Ch2 rong thi found=False
-    assert not det.road_fallback
+    # Ch1 mot minh khong duoc sinh tam hoac mo cong khoi hanh.
     det.reset()
-    seg3_fb = np.full((1, 3, SEG_H, SEG_W), -5.0, dtype=np.float32)
-    seg3_fb[0, 0, 10:64, 24:64] = 5.0
-    seg3_fb[0, 1, 10:64, 24:27] = 5.0
-    seg3_fb[0, 1, 10:64, 61:64] = 5.0
-    eng.seg = seg3_fb
-    eng.reg = np.array([[-0.30, -0.30, 0.0]], dtype=np.float32)
-    res_no_yellow = det.process(frame)
-    assert not res_no_yellow.found, 'mac dinh phai chi bam phan vang Ch2'
-    assert det.last_two_lines_ok
-
-    # 2b. Neu chu dong bat road_fallback=True thi fallback van hoat dong
-    det.road_fallback = True
-    det.reset()
-    res_fb = det.process(frame)
-    assert res_fb.found
-    assert res_fb.cte < -0.05, 'road fallback lech trai nhung cte=%.3f' % res_fb.cte
-    assert det.last_used_fallback
-    assert det.n_fallback == 1
-
-    # 2c. Option B 2-line fallback (khi road_fallback=True): chi thay 2 line trang 2 ben (Ch1)
-    det.reset()
-    seg3_two = np.full((1, 3, SEG_H, SEG_W), -5.0, dtype=np.float32)
-    seg3_two[0, 1, 16:64, 52:56] = 5.0
-    seg3_two[0, 1, 16:64, 96:100] = 5.0
-    eng.seg = seg3_two
-    eng.reg = np.array([[0.18, 0.18, 0.0]], dtype=np.float32)
-    res_two = det.process(frame)
-    assert res_two.found, 'nhan du 2 line 2 ben nhung found=False'
-    assert res_two.cte > 0.05, '2 line lech phai nhung cte=%.3f' % res_two.cte
-    assert det.last_two_lines_ok and det.last_left_line and det.last_right_line
-    assert det.last_used_fallback
-    det.road_fallback = False
+    seg3[0, 0] = -5.0
+    seg3[0, 1] = 5.0
+    seg3[0, 2] = -5.0
+    for _ in range(5):
+        assert not det.process(frame).found
+    assert not det.road_start_ready
 
     # 3. Tuong thich nguoc model 1 kenh cu (64x128)
     det.reset()
@@ -1994,89 +1968,16 @@ def test_lane_cnn_supports_option_b_3channel_and_road_fallback():
     assert res1.found
     assert abs(res1.cte) < 0.15
     assert det.last_road_mask is None
-    assert not det.last_two_lines_ok
-
-
-def test_lane_cnn_recovery_prioritizes_visible_road_edge():
-    from jetracer_baseline.perception.lane_cnn import (
-        CnnLaneDetector, PROC_H, PROC_W, SEG_H, SEG_W)
-
-    cfg = load_config(CONFIG, [os.path.join(ROOT, 'configs', 'cnn_option_b_fast.yaml')])
-    cfg.set('lane.cnn.engine', '')
-    det = CnnLaneDetector(cfg)
-    assert det.single_line_fallback
-    # Phep chieu don gian de tao vach cheo va vet phan chieu trong BEV.
-    det._M_seg = np.diag([PROC_W / float(SEG_W), PROC_H / float(SEG_H), 1.0])
-    det._build_bev_lut()
-    frame = np.zeros((PROC_H, PROC_W, 3), dtype=np.uint8)
-
-    class FakeEngine(object):
-        def infer(self, _x):
-            return {'seg': self.seg, 'reg': self.reg}
-
-    det.engine = FakeEngine()
-    one_boundary = np.full((3, SEG_H, SEG_W), -5.0, dtype=np.float32)
-    for y in range(SEG_H):
-        edge = int(round(18 + (SEG_H - 1 - y) * 0.47))
-        one_boundary[0, y, edge + 2:] = 5.0
-        one_boundary[1, y, edge - 1:edge + 2] = 5.0
-
-    def run(seg, look, preview=False):
-        det.reset()
-        det.engine.seg = seg
-        det.engine.reg = np.array([-0.32, look, 0.0], dtype=np.float32)
-        return det.process(frame, need_aux=preview, compute_bev=preview)
-
-    right = run(one_boundary, 0.33)
-    assert right.found and right.cte_lookahead > 0.20 and det.last_used_fallback
-    no_white = one_boundary.copy()
-    no_white[1] = -5.0
-    assert abs(run(no_white, 0.33).cte_lookahead - right.cte_lookahead) < 1e-6
-
-    glare = no_white.copy()
-    glare[1, 8:58, 4:8] = 5.0  # Vach gia ngoai mat duong.
-    glare[1, 16:48, 84:87] = 5.0
-    glare[0, 16:48, 84:87] = -5.0  # Phan chieu lam thung mask Ch0.
-    assert abs(run(glare, 0.33).cte_lookahead - right.cte_lookahead) < 1e-6
-
-    left = run(one_boundary[:, :, ::-1], -0.33, preview=True)
-    assert left.found and left.cte_lookahead < -0.20 and det.last_used_fallback
-    assert left.debug.any() and det.last_mask.any() and not det.last_center_mask.any()
-
-    wrong_center = one_boundary.copy()
-    wrong_center[2, :, 38:42] = 5.0
-    corrected = run(wrong_center, 0.33)
-    assert corrected.found and corrected.cte_lookahead > 0.20 and det.last_used_fallback
-
-    healthy = one_boundary.copy()
-    healthy[2, :, 63:66] = 5.0
-    assert run(healthy, 0.0).found and not det.last_used_fallback
-
-    # Neu mep doi dien cat dai offset, mot vach co that sat mep van ho tro duoc.
-    white_assists = one_boundary.copy()
-    white_assists[0, :, 94:] = -5.0
-    assert run(white_assists, 0.33).found and det.last_used_fallback
-    two_boundaries = white_assists.copy()
-    two_boundaries[1, :, 94:97] = 5.0
-    assert not run(two_boundaries, 0.33).found
-    white_assists[1] = -5.0
-    assert not run(white_assists, 0.33).found
-
-    # Khi Ch0 phu kin tam nhin, vien anh khong duoc tinh la mep lan.
-    glare[0] = 5.0
-    assert not run(glare, 0.33).found
-    assert not run(one_boundary, -0.33).found and not det.last_used_fallback
+    assert not det.road_guided
 
 
 def test_lane_cnn_road_edges_guide_yellow_without_white():
     from jetracer_baseline.perception.lane_cnn import (
         CnnLaneDetector, PROC_H, PROC_W, SEG_H, SEG_W)
 
-    cfg = load_config(CONFIG, [os.path.join(ROOT, 'configs', name) for name in (
-        'cnn_option_b_fast.yaml', 'road_guided.yaml')])
+    cfg = load_config(CONFIG, [os.path.join(ROOT, 'configs', 'cnn_option_b_fast.yaml')])
     cfg.set('lane.cnn.engine', '')
     det = CnnLaneDetector(cfg)
-    assert det.road_guided
     det._M_seg = np.diag([PROC_W / float(SEG_W), PROC_H / float(SEG_H), 1.0])
     det._build_bev_lut()
     frame = np.zeros((PROC_H, PROC_W, 3), dtype=np.uint8)
@@ -2102,7 +2003,7 @@ def test_lane_cnn_road_edges_guide_yellow_without_white():
     after = det.process(frame, compute_bev=True)
     assert (after.found, after.cte, after.cte_lookahead, after.curvature) == (
         before.found, before.cte, before.cte_lookahead, before.curvature)
-    assert det.last_white_mask is None and det.last_center_mask is None
+    assert det.road_guided
     assert after.debug.any() and det.last_mask.any()
 
     seg[2, :, 20:24] = 10.0
@@ -2127,7 +2028,7 @@ def test_lane_cnn_road_edges_guide_yellow_without_white():
 
 
 def test_speed_track_ui_option_b_panel_and_recent_run_gate():
-    """Giao dien Speed Track chi kiem tra vach trang trong profile Option B thuong."""
+    """Speed Track hien Ch0 va tam vang, khoi hanh theo Ch0."""
     from jetracer_baseline.perception.lane_cnn import (
         CnnLaneDetector, PROC_H, PROC_W, SEG_H, SEG_W)
 
@@ -2141,7 +2042,6 @@ def test_speed_track_ui_option_b_panel_and_recent_run_gate():
     assert st.summary()['loss_pct'] > 80.0
     assert st.recent_loss_pct(20) == 0.0
 
-    # 2. Render panel 3 kenh Option B phai ve duoc 2 line tim + tam vang + banner xanh
     cfg = load_config(CONFIG, [os.path.join(ROOT, 'configs', 'cnn_option_b.yaml')])
     cfg.set('lane.cnn.engine', '')
     cfg.set('lane.cnn.check_reg', False)
@@ -2149,32 +2049,11 @@ def test_speed_track_ui_option_b_panel_and_recent_run_gate():
     engine.cfg = cfg
     det = CnnLaneDetector(cfg)
 
-    class FakeTwoLineEngine(object):
-        def infer(self, _x):
-            s = np.full((1, 3, SEG_H, SEG_W), -5.0, dtype=np.float32)
-            s[0, 0, 10:64, 34:94] = 5.0
-            s[0, 1, 10:64, 34:38] = 5.0
-            s[0, 1, 10:64, 90:94] = 5.0
-            s[0, 2, 10:64, 62:66] = 5.0
-            return {'seg': s, 'reg': np.zeros((1, 3), dtype=np.float32)}
-
-    det.engine = FakeTwoLineEngine()
     engine.lane = det
     engine._dirty = False
-
     frame = np.full((480, 640, 3), 40, dtype=np.uint8)
-    result = engine.process(frame, 1.0 / 30.0)
-    assert result['lane'].found
-    assert result.get('two_lines_ok') is True
-    assert result.get('_preview_white') is not None
-    panel = engine.render_panel(result, fps=30.0, armed=False, driver_kind='nvidia')
-    assert panel.shape[2] == 3 and panel.shape[0] > 480 and panel.shape[1] == 640
 
-    # 3. Cong an toan nut CHAY (_on_run_locked):
-    #    - Chua bat cam -> tu choi
-    #    - Bat cam nhung chi co 1 line (two_lines=False) -> tu choi
-    #    - Nhan du 2 line 2 ben (two_lines=True) -> cho chay & TU DONG tao log CSV
-    workdir = tempfile.mkdtemp(prefix='ui_two_line_gate_')
+    workdir = tempfile.mkdtemp(prefix='ui_green_start_gate_')
     try:
         class Btn(object):
             description = ''
@@ -2216,30 +2095,8 @@ def test_speed_track_ui_option_b_panel_and_recent_run_gate():
         ui._on_run_locked()
         assert not ui._armed and any('MO CAMERA' in m for m in logs)
 
-        # (b) Mo camera nhung chi thay 1 line (two_lines=False) -> tu choi
         ui._grabber = object()
-        engine.stats.reset()
-        for _ in range(15):
-            engine.stats.push(0.0, 0.0, True, 6, two_lines=False)
-        logs[:] = []
-        ui._on_run_locked()
-        assert not ui._armed and any('2 vach line 2 ben' in m for m in logs)
-
-        # (c) Truoc do be xe mat vach 50 frame, roi dat vao du 2 line 20 frame (~0.7s) -> CHAY + TAO LOG
-        engine.stats.reset()
-        for _ in range(50):
-            engine.stats.push(0.0, 0.0, False, 0, two_lines=False)
-        for _ in range(20):
-            engine.stats.push(0.0, 0.0, True, 8, two_lines=True)
-        logs[:] = []
-        ui._on_run_locked()
-        assert ui._armed and ui.mode == MODE_AUTO
-        assert ui._logger is not None and os.path.isfile(ui._logger.path)
-        ui._disarm_locked('stop')
-        assert not ui._armed
-
-        # Mep xanh huong dan: CHAY duoc khi chi co Ch0, cho huong lai moi cap ga.
-        det.road_guided = True
+        # CHAY duoc khi chi co Ch0, cho huong lai moi cap ga.
         det._M_seg = np.diag([PROC_W / float(SEG_W), PROC_H / float(SEG_H), 1.0])
         det._build_bev_lut()
 
@@ -2447,7 +2304,7 @@ def test_run_start_survives_slow_driver_init_and_first_frame_latency():
         ui.engine.rebuild()
 
         ui._on_open()
-        # Cho du >= 8 frame de gat cong 2-line (100% two_lines_ok)
+        # Cho du frame de qua cong mat duong on dinh
         deadline = time.time() + 4.0
         while time.time() < deadline:
             summary = ui.engine.stats.summary()
@@ -2730,14 +2587,6 @@ def test_csi_source_recovers_transient_runtime_drop_and_fails_on_permanent_loss(
             source.release()
         camera_mod.cv2.VideoCapture = original
 
-
-def test_cnn_sorted_median_matches_numpy_median():
-    """_sorted_median phai trung khop tuyet doi voi np.median tren mang da sap xep."""
-    from jetracer_baseline.perception.lane_cnn import CnnLaneDetector
-
-    for length in range(1, 21):
-        arr = np.sort(np.arange(length, dtype=np.int64) * 3 + 2)
-        assert abs(CnnLaneDetector._sorted_median(arr) - float(np.median(arr))) < 1e-12
 
 
 def test_camera_dying_during_build_driver_aborts_run_and_preserves_error_detail():
@@ -3064,26 +2913,9 @@ def test_csi_source_release_nulls_cap_before_releasing():
         camera_mod.cv2.VideoCapture = original
 
 
-def test_cnn_fast_path_vectorized_two_lines_and_lazy_preview_copy():
-    """Vectorized _check_two_lines khop truong hop bien & copy_preview=False bo qua copy mask."""
+def test_cnn_fast_path_copies_only_road_and_center_preview():
     from jetracer_baseline.perception.lane_cnn import CnnLaneDetector, SEG_H, SEG_W
 
-    # 1. Kiem tra cac truong hop bien cua _check_two_lines
-    empty = np.zeros((SEG_H, SEG_W), dtype=np.uint8)
-    assert CnnLaneDetector._check_two_lines(empty, empty, empty) == (False, False, False)
-
-    left_only = np.zeros((SEG_H, SEG_W), dtype=np.uint8)
-    left_only[20:40, 18:22] = 255
-    center = np.zeros((SEG_H, SEG_W), dtype=np.uint8)
-    center[20:40, 62:66] = 255
-    assert CnnLaneDetector._check_two_lines(left_only, center, None) == (True, False, False)
-
-    both = left_only.copy()
-    both[20:40, 102:106] = 255
-    assert CnnLaneDetector._check_two_lines(both, center, None) == (True, True, True)
-    assert CnnLaneDetector._check_two_lines(both, None, None) == (True, True, True)
-
-    # 2. LaneTuningEngine.process(..., copy_preview=False) khong copy 4 mask preview
     cfg = load_config(CONFIG, [os.path.join(ROOT, 'configs', 'cnn_option_b_fast.yaml')])
     cfg.set('lane.cnn.engine', '')
     cfg.set('lane.cnn.check_reg', False)
@@ -3106,11 +2938,11 @@ def test_cnn_fast_path_vectorized_two_lines_and_lazy_preview_copy():
     frame = np.full((240, 320, 3), 40, dtype=np.uint8)
     r_no = engine.process(frame, 1.0 / 30.0, copy_preview=False, need_aux=False)
     assert r_no['lane'].found and r_no['lane'].debug is None
-    assert '_preview_mask' not in r_no and '_preview_white' not in r_no
+    assert '_preview_mask' not in r_no and '_preview_road' not in r_no
     r_yes = engine.process(frame, 1.0 / 30.0, copy_preview=True, need_aux=True)
     assert r_yes['lane'].found and r_yes['lane'].debug is not None
-    assert r_yes.get('two_lines_ok') is True
-    assert r_yes.get('_preview_mask') is not None and r_yes.get('_preview_white') is not None
+    assert r_yes['_preview_mask'].any() and r_yes['_preview_road'].any()
+    assert '_preview_white' not in r_yes
     # Kiem tra fit LUT tren duong nong khop voi ket qua khi bat BEV/aux
     assert abs(r_no['lane'].cte - r_yes['lane'].cte) < 1e-6
 

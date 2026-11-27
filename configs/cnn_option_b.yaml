@@ -41,7 +41,6 @@ lane:
     check_reg: true
     reg_disagree: 0.35
     # Chi bam DUNG phan vang (Ch2 centerline) model du doan, KHONG tu suy fallback
-    road_fallback: false
 
 # Gain điều khiển CNN (kế thừa profile configs/cnn.yaml)
 control:

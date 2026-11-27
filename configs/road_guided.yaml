@@ -1,7 +1,3 @@
-# Ghi de sau profile Option B de dung mep mat duong Ch0 huong dan duong tam Ch2 o cua.
-lane:
-  cnn:
-    road_guided: true
-
+# Giu override cho cac notebook da tro den tep nay. Option B tu dung Ch0 va Ch2.
 control:
   road_turn_steer_gain: 1.15
