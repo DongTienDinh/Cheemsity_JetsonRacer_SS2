@@ -65,6 +65,7 @@ checkpoints/
 
 # Moi truong ao, bien moi truong va IDE
 .venv/
+.venv_cuda/
 venv/
 .env
 .env.*
@@ -83,3 +84,11 @@ Desktop.ini
 
 # Pipeline train tren PC - KHONG day len Jetson (dataset, checkpoint, notebook train)
 training/
+
+# Tai lieu, the le, de bai - chi luu cuc bo tren PC, KHONG push/pull len Jetson
+docs/
+*.pdf
+*.doc
+*.docx
+*.ppt
+*.pptx

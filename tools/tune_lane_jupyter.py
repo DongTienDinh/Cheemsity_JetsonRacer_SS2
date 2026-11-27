@@ -47,7 +47,7 @@ def launch(config_path='configs/default.yaml', source_kind='csi',
     de trong -> camera that dung 'nvidia', replay video dung 'dryrun'.
     """
     print('NGUON BAM VACH: %s'
-          % ('MODEL CNN (co configs/cnn.yaml)' if overrides else
+          % (('MODEL CNN (overrides=%s)' % overrides) if overrides else
              'CV co dien (KHONG co override -> KHONG dung model)'))
     return launch_tuning_ui(config_path=config_path, source_kind=source_kind,
                             video_path=video_path, driver_kind=driver_kind,

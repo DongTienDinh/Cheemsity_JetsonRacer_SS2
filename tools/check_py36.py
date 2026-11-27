@@ -16,7 +16,7 @@ import io
 import os
 import sys
 
-SKIP_DIRS = ('.git', '__pycache__', 'logs', 'reports', 'data', '.venv', 'venv')
+SKIP_DIRS = ('.git', '__pycache__', 'logs', 'reports', 'data', '.venv', '.venv_cuda', 'venv')
 PY37_MODULES = ('dataclasses', 'zoneinfo', 'graphlib', 'contextvars')
 
 

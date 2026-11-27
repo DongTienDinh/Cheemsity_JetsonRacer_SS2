@@ -1,0 +1,51 @@
+# Model Option B #1 (Ưu tiên chạy chính): LaneTiny-ResSE (3 kênh + Reg)
+#   - 156,654 params (~630 KB ONNX), 156.8 MFLOPs — rất nhẹ cho Jetson Nano FP16
+#   - Test locked (198 frames): Road IoU 0.990 | White IoU 0.926 | Center IoU 0.299
+#     CTE MAE 0.0248 | Lookahead MAE 0.0527 (tốt nhất trong 5 kiến trúc)
+#   - 3 kênh output: Ch0=drivable_road, Ch1=white_line, Ch2=centerline (kèm fallback)
+#
+# Cách dùng trên Jetson Nano:
+#   1. Build engine TRÊN CHÍNH XE:
+#        /usr/src/tensorrt/bin/trtexec --onnx=models/lane_option_b_resse.onnx \
+#            --fp16 --workspace=256 --saveEngine=models/lane_option_b_resse.engine
+#   2. Đo latency & kiểm tra DẤU cte:
+#        python3 tools/bench_lane_cnn.py --override configs/cnn_option_b.yaml
+#        python3 tools/bench_lane_cnn.py --override configs/cnn_option_b.yaml --watch --source csi
+#   3. Chạy xe:
+#        python3 -m src.jetracer_baseline.cli run --task speed --driver nvidia \
+#            --override configs/cnn_option_b.yaml --record
+
+lane:
+  mode: cnn
+  cnn:
+    backend: trt
+    engine: models/lane_option_b_resse.engine
+    # Hình học KHỚP TUYỆT ĐỐI với tools/train_lane_option_b.py (KHÔNG đổi khi chưa train lại)
+    roi_top: 0.34
+    warp_src: [[0.00, 0.92], [1.00, 0.92], [0.66, 0.42], [0.33, 0.42]]
+    warp_dst_margin: 0.32
+    min_bands: 2
+    band_min_pixels: 8
+    lookahead: 0.60
+    check_reg: true
+    reg_disagree: 0.35
+    road_fallback: true
+
+# Gain điều khiển CNN (kế thừa profile configs/cnn.yaml)
+control:
+  pid:
+    kp: 1.10
+    kd: 0.12
+  steer_lookahead_weight: 0.70
+  curve_enter: 0.12
+  curve_exit: 0.08
+  curve_feedforward: 1.80
+  corner_steer_gain: 2.40
+  slowdown: 0.20
+  curve_brake: 0.30
+  corner_hold_s: 0.70
+  steer_max: 1.00
+  corner_steer_max: 1.00
+  driver:
+    steering_gain: -1.00
+    throttle_gain: 1.00

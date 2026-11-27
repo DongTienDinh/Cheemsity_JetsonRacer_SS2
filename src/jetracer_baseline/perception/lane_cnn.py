@@ -257,9 +257,17 @@ class CnnLaneDetector(object):
 
         self.last_infer_ms = 0.0
         self.last_total_ms = 0.0
-        self.last_mask = None      # mask ROI 256x128 do model xuat ra
-        self.last_bev = None       # cung mask do sau khi warp sang BEV
+        self.last_mask = None        # mask ROI 256x128 dung de fit (centerline hoac fallback)
+        self.last_road_mask = None   # Option B Ch0 (64x128) neu model 3 kenh
+        self.last_white_mask = None  # Option B Ch1 (64x128) neu model 3 kenh
+        self.last_center_mask = None # Option B Ch2 (64x128) neu model 3 kenh
+        self.last_left_line = False
+        self.last_right_line = False
+        self.last_two_lines_ok = False
+        self.last_used_fallback = False
+        self.last_bev = None         # cung mask do sau khi warp sang BEV
         self.n_disagree = 0
+        self.n_fallback = 0
         self._reset_state()
         if self.engine is not None:
             self._warmup()
@@ -284,6 +292,9 @@ class CnnLaneDetector(object):
         # bao found=False de FSM ha ga / roi ve CV.
         self.reg_disagree = float(c('lane.cnn.reg_disagree', 0.35))
         self.check_reg = bool(c('lane.cnn.check_reg', True))
+        # Option B (3 kenh): neu kenh centerline bi mat/dut, tu suy tam duong tu
+        # mat duong (Ch0 - Ch1) de xe khong mat lai dot ngot.
+        self.road_fallback = bool(c('lane.cnn.road_fallback', True))
 
     def _reset_state(self):
         self._cte = 0.0
@@ -376,13 +387,13 @@ class CnnLaneDetector(object):
         """Lay seg/reg tu dict output. Uu tien TEN, du phong theo KICH THUOC.
 
         Du phong ton tai vi mot so ban TensorRT doi ten binding khi build engine.
-        Hai dau ra co kich thuoc chenh nhau rat xa (8192 vs 3) nen phan biet bang
-        kich thuoc la an toan tuyet doi o bai nay.
+        Ho tro ca model 1 kenh cu (64x128 = 8192) va Option B 3 kenh
+        (3x64x128 = 24576: Ch0=road, Ch1=white_line, Ch2=centerline).
         """
         seg, reg = outs.get('seg'), outs.get('reg')
         if seg is None or reg is None:
             for v in outs.values():
-                if v.size == SEG_H * SEG_W:
+                if v.size in (SEG_H * SEG_W, 3 * SEG_H * SEG_W):
                     seg = v
                 elif v.size == 3:
                     reg = v
@@ -391,6 +402,64 @@ class CnnLaneDetector(object):
                 'Khong tim thay dau ra seg trong engine. Cac dau ra: %s'
                 % dict((k, v.shape) for k, v in outs.items()))
         return seg, (None if reg is None else reg.ravel())
+
+    @staticmethod
+    def _check_two_lines(white_s, center_s, road_s):
+        """Kiem tra da nhan du 2 line trang ben trai + ben phai cua lan duong chua."""
+        if white_s is None:
+            return False, False, False
+        left_rows, right_rows = 0, 0
+        for y in range(SEG_H // 4, SEG_H):
+            w_xs = np.flatnonzero(white_s[y])
+            if len(w_xs) == 0:
+                continue
+            ref_cx = None
+            if center_s is not None:
+                c_xs = np.flatnonzero(center_s[y])
+                if len(c_xs) >= 1:
+                    ref_cx = float(np.median(c_xs))
+            if ref_cx is None and road_s is not None:
+                r_xs = np.flatnonzero(road_s[y])
+                if len(r_xs) >= 4:
+                    ref_cx = float(np.median(r_xs))
+            if ref_cx is None:
+                if (int(w_xs[-1]) - int(w_xs[0])) >= 14:
+                    ref_cx = 0.5 * (float(w_xs[0]) + float(w_xs[-1]))
+                else:
+                    ref_cx = SEG_W * 0.5
+            if np.any(w_xs < (ref_cx - 4.0)):
+                left_rows += 1
+            if np.any(w_xs > (ref_cx + 4.0)):
+                right_rows += 1
+        has_left = left_rows >= 4
+        has_right = right_rows >= 4
+        return has_left, has_right, (has_left and has_right)
+
+    @staticmethod
+    def _road_fallback_mask(road_s, white_s):
+        """Suy dai tam duong 256x128 tu mat duong (Ch0-Ch1) hoac giua 2 line trang (Ch1)."""
+        clean = None
+        if road_s is not None:
+            if white_s is not None:
+                clean = cv2.bitwise_and(road_s, cv2.bitwise_not(white_s))
+            else:
+                clean = road_s
+        fb = np.zeros((SEG_H, SEG_W), np.uint8)
+        for y in range(SEG_H):
+            cx = None
+            if clean is not None:
+                xs = np.flatnonzero(clean[y])
+                if len(xs) >= 4:
+                    cx = int(np.median(xs))
+            if cx is None and white_s is not None:
+                w_xs = np.flatnonzero(white_s[y])
+                if len(w_xs) >= 2 and (int(w_xs[-1]) - int(w_xs[0])) >= 14:
+                    cx = int(0.5 * (int(w_xs[0]) + int(w_xs[-1])))
+            if cx is not None:
+                x0 = max(0, cx - 2)
+                x1 = min(SEG_W, cx + 3)
+                fb[y, x0:x1] = 255
+        return cv2.resize(fb, (IN_W, IN_H), interpolation=cv2.INTER_NEAREST)
 
     # ------------------------------------------------------------------ chay
     def process(self, frame_bgr):
@@ -406,17 +475,49 @@ class CnnLaneDetector(object):
         self.last_infer_ms = (time.time() - t1) * 1000.0
 
         seg, reg = self._pick_outputs(outs)
-        seg = seg.reshape(SEG_H, SEG_W)
-
         # Nguong 0 tren logits == sigmoid > 0.5. Model co y khong co Sigmoid.
-        mask = (seg > 0).astype(np.uint8) * 255
+        if seg.size == 3 * SEG_H * SEG_W:
+            seg3 = seg.reshape(3, SEG_H, SEG_W)
+            road_s = (seg3[0] > 0).astype(np.uint8) * 255
+            white_s = (seg3[1] > 0).astype(np.uint8) * 255
+            center_s = (seg3[2] > 0).astype(np.uint8) * 255
+            self.last_road_mask = road_s
+            self.last_white_mask = white_s
+            self.last_center_mask = center_s
+            hl, hr, two_ok = self._check_two_lines(white_s, center_s, road_s)
+            self.last_left_line = hl
+            self.last_right_line = hr
+            self.last_two_lines_ok = two_ok
+            raw_mask_s = center_s
+        else:
+            seg1 = seg.reshape(SEG_H, SEG_W)
+            self.last_road_mask = None
+            self.last_white_mask = None
+            self.last_center_mask = None
+            self.last_left_line = False
+            self.last_right_line = False
+            self.last_two_lines_ok = False
+            raw_mask_s = (seg1 > 0).astype(np.uint8) * 255
+
         # Hai buoc phong to nay lap Y HET duong danh gia luc train. Gop lam mot
         # buoc se cho so khac di - it thoi, nhung du de moi con so do o PC khong
         # con dung tren xe.
-        mask = cv2.resize(mask, (IN_W, IN_H), interpolation=cv2.INTER_NEAREST)
+        mask = cv2.resize(raw_mask_s, (IN_W, IN_H), interpolation=cv2.INTER_NEAREST)
         self.last_mask = mask
+        self.last_used_fallback = False
 
         co, t_max, n_bands, npix = self.mask_to_fit(mask)
+        if co is None and self.road_fallback and (
+                self.last_road_mask is not None or self.last_white_mask is not None):
+            fb_mask = self._road_fallback_mask(
+                self.last_road_mask, self.last_white_mask)
+            co_fb, t_max_fb, n_bands_fb, npix_fb = self.mask_to_fit(fb_mask)
+            if co_fb is not None:
+                co, t_max, n_bands, npix = co_fb, t_max_fb, n_bands_fb, npix_fb
+                self.last_mask = fb_mask
+                self.last_used_fallback = True
+                self.n_fallback += 1
+
         if co is None:
             self.last_total_ms = (time.time() - t0) * 1000.0
             return LaneResult(False, self._cte, self._curv, npix, self.last_bev,

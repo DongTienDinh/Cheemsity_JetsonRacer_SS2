@@ -1886,6 +1886,132 @@ def test_live_runner_does_not_loop_forever_on_cached_eof_frame(tmpdir=None):
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def test_lane_cnn_supports_option_b_3channel_and_road_fallback():
+    """CnnLaneDetector phai ho tro ca 3 kenh Option B, road fallback va 1 kenh cu."""
+    from jetracer_baseline.perception.lane_cnn import CnnLaneDetector, SEG_H, SEG_W
+
+    for cfg_name, exp_engine in (
+        ('cnn_option_b.yaml', 'models/lane_option_b_resse.engine'),
+        ('cnn_option_b_fastscnn.yaml', 'models/lane_option_b_fastscnn.engine'),
+    ):
+        cfg_opt = load_config(CONFIG, [os.path.join(ROOT, 'configs', cfg_name)])
+        assert cfg_opt.get('lane.mode') == 'cnn'
+        assert abs(float(cfg_opt.get('lane.cnn.roi_top')) - 0.34) < 1e-6
+        assert cfg_opt.get('lane.cnn.engine') == exp_engine
+
+    class FakeEngine(object):
+        def __init__(self):
+            self.seg = None
+            self.reg = None
+
+        def infer(self, _x):
+            return {'seg': self.seg, 'reg': self.reg}
+
+    cfg = load_config(CONFIG, [os.path.join(ROOT, 'configs', 'cnn_option_b.yaml')])
+    cfg.set('lane.cnn.engine', '')
+    cfg.set('lane.cnn.check_reg', False)
+    det = CnnLaneDetector(cfg)
+    eng = FakeEngine()
+    det.engine = eng
+    frame = np.zeros((480, 640, 3), np.uint8)
+
+    # 1. Option B 3 kenh: centerline (Ch2) lech phai -> cte duong, khong fallback
+    seg3 = np.full((1, 3, SEG_H, SEG_W), -5.0, dtype=np.float32)
+    seg3[0, 0, 10:64, 50:110] = 5.0
+    seg3[0, 2, 10:64, 78:84] = 5.0
+    eng.seg = seg3
+    eng.reg = np.array([[0.25, 0.25, 0.0]], dtype=np.float32)
+    res = det.process(frame)
+    assert res.found
+    assert res.cte > 0.05, 'centerline lech phai nhung cte=%.3f' % res.cte
+    assert not det.last_used_fallback
+    assert det.last_road_mask is not None and det.last_center_mask is not None
+
+    # 2. Option B road fallback: centerline (Ch2) rong, road (Ch0) lech trai -> fallback hoat dong
+    det.reset()
+    seg3_fb = np.full((1, 3, SEG_H, SEG_W), -5.0, dtype=np.float32)
+    seg3_fb[0, 0, 10:64, 24:64] = 5.0
+    seg3_fb[0, 1, 10:64, 24:27] = 5.0
+    seg3_fb[0, 1, 10:64, 61:64] = 5.0
+    eng.seg = seg3_fb
+    eng.reg = np.array([[-0.30, -0.30, 0.0]], dtype=np.float32)
+    res_fb = det.process(frame)
+    assert res_fb.found
+    assert res_fb.cte < -0.05, 'road fallback lech trai nhung cte=%.3f' % res_fb.cte
+    assert det.last_used_fallback
+    assert det.n_fallback == 1
+
+    # 2b. Option B 2-line fallback: ca centerline (Ch2) lan road (Ch0) rong,
+    # CHI thay 2 line trang 2 ben (Ch1) -> van suy duoc tam & bao two_lines_ok!
+    det.reset()
+    seg3_two = np.full((1, 3, SEG_H, SEG_W), -5.0, dtype=np.float32)
+    seg3_two[0, 1, 16:64, 52:56] = 5.0
+    seg3_two[0, 1, 16:64, 96:100] = 5.0
+    eng.seg = seg3_two
+    eng.reg = np.array([[0.18, 0.18, 0.0]], dtype=np.float32)
+    res_two = det.process(frame)
+    assert res_two.found, 'nhan du 2 line 2 ben nhung found=False'
+    assert res_two.cte > 0.05, '2 line lech phai nhung cte=%.3f' % res_two.cte
+    assert det.last_two_lines_ok and det.last_left_line and det.last_right_line
+    assert det.last_used_fallback
+
+    # 3. Tuong thich nguoc model 1 kenh cu (64x128)
+    det.reset()
+    seg1 = np.full((1, 1, SEG_H, SEG_W), -5.0, dtype=np.float32)
+    seg1[0, 0, 10:64, 61:67] = 5.0
+    eng.seg = seg1
+    eng.reg = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+    res1 = det.process(frame)
+    assert res1.found
+    assert abs(res1.cte) < 0.15
+    assert det.last_road_mask is None
+    assert not det.last_two_lines_ok
+
+
+def test_speed_track_ui_option_b_panel_and_recent_run_gate():
+    """Giao dien Speed Track hien 2 line Option B va cho bam CHAY ngay khi dat vao 2 line."""
+    from jetracer_baseline.perception.lane_cnn import CnnLaneDetector, SEG_H, SEG_W
+
+    # 1. RollingStats.recent_loss_pct: 100 frame mat vach luc be xe + 20 frame
+    # thay vach gan nhat -> recent_loss_pct phai la 0%, khong chan nut CHAY.
+    st = RollingStats(window=200)
+    for _ in range(100):
+        st.push(0.0, 0.0, False, 0)
+    for _ in range(20):
+        st.push(0.02, 0.02, True, 6)
+    assert st.summary()['loss_pct'] > 80.0
+    assert st.recent_loss_pct(20) == 0.0
+
+    # 2. Render panel 3 kenh Option B phai ve duoc 2 line tim + tam vang + banner xanh
+    cfg = load_config(CONFIG, [os.path.join(ROOT, 'configs', 'cnn_option_b.yaml')])
+    cfg.set('lane.cnn.engine', '')
+    cfg.set('lane.cnn.check_reg', False)
+    engine = LaneTuningEngine(CONFIG)
+    engine.cfg = cfg
+    det = CnnLaneDetector(cfg)
+
+    class FakeTwoLineEngine(object):
+        def infer(self, _x):
+            s = np.full((1, 3, SEG_H, SEG_W), -5.0, dtype=np.float32)
+            s[0, 0, 10:64, 34:94] = 5.0
+            s[0, 1, 10:64, 34:38] = 5.0
+            s[0, 1, 10:64, 90:94] = 5.0
+            s[0, 2, 10:64, 62:66] = 5.0
+            return {'seg': s, 'reg': np.zeros((1, 3), dtype=np.float32)}
+
+    det.engine = FakeTwoLineEngine()
+    engine.lane = det
+    engine._dirty = False
+
+    frame = np.full((480, 640, 3), 40, dtype=np.uint8)
+    result = engine.process(frame, 1.0 / 30.0)
+    assert result['lane'].found
+    assert result.get('two_lines_ok') is True
+    assert result.get('_preview_white') is not None
+    panel = engine.render_panel(result, fps=30.0, armed=False, driver_kind='nvidia')
+    assert panel.shape[2] == 3 and panel.shape[0] > 480 and panel.shape[1] == 640
+
+
 if __name__ == '__main__':
     failures = 0
     for name, fn in sorted(list(globals().items())):

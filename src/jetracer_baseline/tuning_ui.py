@@ -174,6 +174,14 @@ class RollingStats(object):
                 np.max(np.abs(steer)) if np.max(np.abs(steer)) > 0 else 1.0))),
         }
 
+    def recent_loss_pct(self, k=20):
+        """Ty le mat vach tren k frame GAN NHAT (tranh bi chan boi frame cu luc be xe)."""
+        with self._lock:
+            if not self._found:
+                return 100.0
+            tail = self._found[-int(k):]
+            return float(100.0 * (1.0 - np.mean(tail)))
+
     def cte_history(self):
         with self._lock:
             return list(self._cte)
@@ -449,45 +457,100 @@ class LaneTuningEngine(object):
             # Chi ~32 KiB voi mask CNN 256x128; doi lai preview khong can khoa
             # TensorRT detector va khong the lay nham mask cua frame sau.
             result['_preview_mask'] = lane_mask.copy()
+        road_mask = getattr(self.lane, 'last_road_mask', None)
+        white_mask = getattr(self.lane, 'last_white_mask', None)
+        center_mask = getattr(self.lane, 'last_center_mask', None)
+        if white_mask is not None:
+            # Option B 3 kenh (64x128 = 8 KiB/kenh) -> ve ro 2 line trang 2 ben + duong + tam
+            result['_preview_white'] = white_mask.copy()
+            if road_mask is not None:
+                result['_preview_road'] = road_mask.copy()
+            if center_mask is not None:
+                result['_preview_center'] = center_mask.copy()
+            result['left_line'] = bool(getattr(self.lane, 'last_left_line', False))
+            result['right_line'] = bool(getattr(self.lane, 'last_right_line', False))
+            result['two_lines_ok'] = bool(getattr(self.lane, 'last_two_lines_ok', False))
+            result['used_fallback'] = bool(getattr(self.lane, 'last_used_fallback', False))
         return result
 
     # ------------------------------------------------------------------ render
     def render_panel(self, result, fps=0.0, armed=False, width=None,
                      driver_kind='dryrun', ui_mode=None, override_cmd=None):
-        """Panel 2x2: anh+mask, mask nhi phan, bird's-eye+fit, do thi CTE."""
+        """Panel 2x2: anh+mask, mask nhi phan/3-kenh, bird's-eye+fit, do thi CTE."""
         res = result['lane']
         proc = result['proc']
         ph, pw = proc.shape[:2]
 
-        y0 = int(ph * float(self.cfg.get('lane.roi_top', 0.55)))
+        if hasattr(self.lane, '_binarise'):
+            y0 = int(ph * float(self.cfg.get('lane.roi_top', 0.55)))
+        else:
+            y0 = int(ph * float(getattr(self.lane, 'roi_top',
+                                        self.cfg.get('lane.cnn.roi_top', 0.55))))
         mask = np.zeros((ph, pw), np.uint8)
         lane_mask = result.get('_preview_mask')
-        if hasattr(self.lane, '_binarise'):
-            # CV co dien: mask mau tinh lai tren dung anh proc dang hien thi.
-            if ph > y0:
-                mask[y0:, :] = self.lane._binarise(proc[y0:, :])
-        elif lane_mask is not None or getattr(self.lane, 'last_mask', None) is not None:
-            # CNN: mask model xuat ra o khong gian ROI (256x128) - keo ve dung o
-            # ROI cua anh proc de chong len camera. KHONG dung `res.debug`: cho
-            # do la anh BEV, dung cho panel 3.
-            if ph > y0:
-                # Pipeline va preview chay hai thread rieng. Snapshot nay duoc
-                # chup ngay sau inference, tranh preview doc ``last_mask`` cua
-                # frame ke tiep trong khi dang ve frame hien tai.
-                if lane_mask is None:
-                    lane_mask = self.lane.last_mask
-                mask[y0:, :] = cv2.resize(lane_mask, (pw, ph - y0),
-                                          interpolation=cv2.INTER_NEAREST)
+        opt_b_white = result.get('_preview_white')
+        opt_b_road = result.get('_preview_road')
+        opt_b_center = result.get('_preview_center')
 
-        # (1) anh that + mask phu len + duong ROI
-        overlay = proc.copy()
-        overlay[mask > 0] = (0, 0, 255)
-        cv2.line(overlay, (0, y0), (pw, y0), (0, 255, 255), 1)
-        _label(overlay, 'CAMERA + MASK VACH')
+        if opt_b_white is not None and ph > y0:
+            # Option B 3 kenh: ve ro mat duong (xanh), 2 line 2 ben (tim), tam ao (vang)
+            roi_h = ph - y0
+            w_up = cv2.resize(opt_b_white, (pw, roi_h), interpolation=cv2.INTER_NEAREST)
+            r_up = (cv2.resize(opt_b_road, (pw, roi_h), interpolation=cv2.INTER_NEAREST)
+                    if opt_b_road is not None else None)
+            c_up = (cv2.resize(opt_b_center, (pw, roi_h), interpolation=cv2.INTER_NEAREST)
+                    if opt_b_center is not None else None)
+            if lane_mask is not None:
+                c_draw = cv2.resize(lane_mask, (pw, roi_h), interpolation=cv2.INTER_NEAREST)
+            else:
+                c_draw = c_up
 
-        # (2) mask nhi phan - nhin thang xem nguong co sach khong
-        binary = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        _label(binary, 'MASK (nguong mau)')
+            ov = proc.copy()
+            roi_ov = ov[y0:, :]
+            binary = np.zeros((ph, pw, 3), np.uint8)
+            roi_bin = binary[y0:, :]
+            if r_up is not None:
+                roi_ov[r_up > 0] = (40, 180, 40)
+                roi_bin[r_up > 0] = (25, 95, 25)
+            roi_ov[w_up > 0] = (240, 50, 235)      # 2 line trang 2 ben -> tim sang
+            roi_bin[w_up > 0] = (255, 70, 255)
+            if c_draw is not None:
+                roi_ov[c_draw > 0] = (0, 230, 255) # tam duong -> vang tuoi
+                roi_bin[c_draw > 0] = (0, 235, 255)
+            overlay = cv2.addWeighted(ov, 0.50, proc, 0.50, 0)
+            cv2.line(overlay, (0, y0), (pw, y0), (0, 255, 255), 1)
+            cv2.line(binary, (0, y0), (pw, y0), (70, 70, 70), 1)
+            _label(overlay, 'CAMERA + 2 LINE (TIM) + TAM (VANG)')
+            if result.get('two_lines_ok'):
+                tag_txt, tag_col = '2 LINE: DU TRAI+PHAI', (60, 230, 60)
+            elif result.get('left_line') or result.get('right_line'):
+                side = 'TRAI' if result.get('left_line') else 'PHAI'
+                tag_txt, tag_col = '1 LINE (%s) - BAM TAM' % side, (0, 220, 255)
+            else:
+                tag_txt, tag_col = 'CHUA THAY 2 LINE', (60, 60, 255)
+            _label(binary, 'OPTION B: ' + tag_txt)
+            cv2.circle(binary, (pw - 10, 8), 5, tag_col, -1)
+        else:
+            if hasattr(self.lane, '_binarise'):
+                # CV co dien: mask mau tinh lai tren dung anh proc dang hien thi.
+                if ph > y0:
+                    mask[y0:, :] = self.lane._binarise(proc[y0:, :])
+            elif lane_mask is not None or getattr(self.lane, 'last_mask', None) is not None:
+                if ph > y0:
+                    if lane_mask is None:
+                        lane_mask = self.lane.last_mask
+                    mask[y0:, :] = cv2.resize(lane_mask, (pw, ph - y0),
+                                              interpolation=cv2.INTER_NEAREST)
+
+            # (1) anh that + mask phu len + duong ROI
+            overlay = proc.copy()
+            overlay[mask > 0] = (0, 0, 255)
+            cv2.line(overlay, (0, y0), (pw, y0), (0, 255, 255), 1)
+            _label(overlay, 'CAMERA + MASK VACH')
+
+            # (2) mask nhi phan - nhin thang xem nguong co sach khong
+            binary = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            _label(binary, 'MASK (nguong mau)')
 
         # (3) bird's-eye + duong fit + diem ngam
         warped = res.debug
@@ -501,7 +564,11 @@ class LaneTuningEngine(object):
                 x = res.fit[0] * t * t + res.fit[1] * t + res.fit[2]
                 pts.append([int(x), ph - int(t * ph)])
             cv2.polylines(bev, [np.array(pts, np.int32)], False, (0, 0, 255), 2)
-            t_look = float(self.cfg.get('lane.lookahead', 0.6))
+            if hasattr(self.lane, '_binarise'):
+                t_look = float(self.cfg.get('lane.lookahead', 0.6))
+            else:
+                t_look = float(getattr(self.lane, 'lookahead',
+                                       self.cfg.get('lane.cnn.lookahead', 0.6)))
             xl = res.fit[0] * t_look * t_look + res.fit[1] * t_look + res.fit[2]
             cv2.circle(bev, (int(xl), ph - int(t_look * ph)), 5, (255, 0, 255), -1)
         _label(bev, "BIRD'S-EYE + duong fit")
@@ -624,7 +691,12 @@ def _draw_banner(panel, res, result, fps, armed, driver_kind='dryrun',
                  else 'LAI TAY (DRYRUN - banh khong quay)')
         colour = (255, 160, 60)
     elif not armed:
-        state, colour = 'DANG DUNG (bam CHAY hoac LAI TAY)', (160, 160, 160)
+        if res.found and result.get('two_lines_ok'):
+            state, colour = 'SAN SANG CHAY (2 LINE OK - bam CHAY)', (80, 235, 80)
+        elif res.found:
+            state, colour = 'SAN SANG CHAY (CO VACH - bam CHAY)', (120, 220, 120)
+        else:
+            state, colour = 'DANG DUNG (dat xe vao 2 line roi bam CHAY)', (160, 160, 160)
     elif not live:
         state, colour = 'DRYRUN - BANH KHONG QUAY', (0, 200, 255)
     elif ramp < 1.0:
@@ -1868,14 +1940,18 @@ class LaneTuningUI(object):
             self._log('Xe dang chay roi.')
             return
         summary = self.engine.stats.summary()
-        # Khong cho ARM khi detector dang mat vach lien tuc: xe se lao theo gia
-        # tri cte cu. Day la loi de xay ra nhat khi vua keo slider xong.
-        if summary is not None and summary['n'] >= 20 and summary['loss_pct'] > 20.0:
-            self._log('TU CHOI CHAY: dang mat vach %.0f%% frame. Xe se lao theo '
-                      'gia tri cte cu. Chinh nguong cho mask sach roi bam lai.'
-                      % summary['loss_pct'])
-            self._set_status('TU CHOI CHAY - mask chua on')
+        # Kiem tra tren 20 frame GAN NHAT (~0.7s) thay vi ca cua so 200 frame cu:
+        # khi be xe dat vao giua 2 line, thay vach on la bam CHAY duoc NGAY ma
+        # khong bi chan oan boi cac frame nhin san/tuong luc be xe truoc do.
+        recent_loss = self.engine.stats.recent_loss_pct(20)
+        if summary is not None and summary['n'] >= 10 and recent_loss > 20.0:
+            self._log('TU CHOI CHAY: dang mat vach %.0f%% o 20 frame gan nhat. '
+                      'Dat xe vao giua 2 line cho thay vach roi bam lai.'
+                      % recent_loss)
+            self._set_status('TU CHOI CHAY - dat xe vao 2 line truoc')
             return
+        # Xoa lich su cu truoc khi chay (frame luc be xe) de thong ke luot chay sach
+        self.engine.stats.reset()
         try:
             if self._driver is None:
                 self._driver = build_driver(self.driver_kind, self.engine.cfg)
@@ -1968,12 +2044,18 @@ class LaneTuningUI(object):
     # -------------------------------------------------------------------- view
     def _nguon_banner(self):
         w = self.widgets
+        if self.dung_cnn:
+            eng = str(self.engine.get_param('lane.cnn.engine', ''))
+            backend = str(self.engine.get_param('lane.cnn.backend', 'trt')).upper()
+            label = 'MODEL CNN (%s) - %s' % (backend, eng)
+            bg = '#1b7f3b'
+        else:
+            label = 'CV CO DIEN (nguong mau) - KHONG dung model'
+            bg = '#8a6d1f'
         return w.HTML(
             '<div style="padding:6px 10px;margin-bottom:6px;border-radius:4px;'
             'font-weight:bold;background:%s;color:#fff">NGUON BAM VACH: %s</div>'
-            % (('#1b7f3b', 'MODEL CNN (TensorRT) - models/lane_tiny.engine')
-               if self.dung_cnn else
-               ('#8a6d1f', 'CV CO DIEN (nguong mau) - KHONG dung model')))
+            % (bg, label))
 
     # --- anh xa cho num CUA SOM ------------------------------------------
     # 0.00 = cua muon, nhe nhang   |   1.00 = xong vao cua som va manh
