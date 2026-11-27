@@ -1927,7 +1927,8 @@ def test_lane_cnn_supports_option_b_3channel_and_road_fallback():
     assert not det.last_used_fallback
     assert det.last_road_mask is not None and det.last_center_mask is not None
 
-    # 2. Option B road fallback: centerline (Ch2) rong, road (Ch0) lech trai -> fallback hoat dong
+    # 2. Mac dinh Option B chi bam DUNG phan vang (Ch2): khi Ch2 rong thi found=False
+    assert not det.road_fallback
     det.reset()
     seg3_fb = np.full((1, 3, SEG_H, SEG_W), -5.0, dtype=np.float32)
     seg3_fb[0, 0, 10:64, 24:64] = 5.0
@@ -1935,14 +1936,20 @@ def test_lane_cnn_supports_option_b_3channel_and_road_fallback():
     seg3_fb[0, 1, 10:64, 61:64] = 5.0
     eng.seg = seg3_fb
     eng.reg = np.array([[-0.30, -0.30, 0.0]], dtype=np.float32)
+    res_no_yellow = det.process(frame)
+    assert not res_no_yellow.found, 'mac dinh phai chi bam phan vang Ch2'
+    assert det.last_two_lines_ok
+
+    # 2b. Neu chu dong bat road_fallback=True thi fallback van hoat dong
+    det.road_fallback = True
+    det.reset()
     res_fb = det.process(frame)
     assert res_fb.found
     assert res_fb.cte < -0.05, 'road fallback lech trai nhung cte=%.3f' % res_fb.cte
     assert det.last_used_fallback
     assert det.n_fallback == 1
 
-    # 2b. Option B 2-line fallback: ca centerline (Ch2) lan road (Ch0) rong,
-    # CHI thay 2 line trang 2 ben (Ch1) -> van suy duoc tam & bao two_lines_ok!
+    # 2c. Option B 2-line fallback (khi road_fallback=True): chi thay 2 line trang 2 ben (Ch1)
     det.reset()
     seg3_two = np.full((1, 3, SEG_H, SEG_W), -5.0, dtype=np.float32)
     seg3_two[0, 1, 16:64, 52:56] = 5.0
@@ -1954,6 +1961,7 @@ def test_lane_cnn_supports_option_b_3channel_and_road_fallback():
     assert res_two.cte > 0.05, '2 line lech phai nhung cte=%.3f' % res_two.cte
     assert det.last_two_lines_ok and det.last_left_line and det.last_right_line
     assert det.last_used_fallback
+    det.road_fallback = False
 
     # 3. Tuong thich nguoc model 1 kenh cu (64x128)
     det.reset()
@@ -2064,7 +2072,7 @@ def test_speed_track_ui_option_b_panel_and_recent_run_gate():
             engine.stats.push(0.0, 0.0, True, 6, two_lines=False)
         logs[:] = []
         ui._on_run_locked()
-        assert not ui._armed and any('2 line 2 ben' in m for m in logs)
+        assert not ui._armed and any('2 vach line 2 ben' in m for m in logs)
 
         # (c) Truoc do be xe mat vach 50 frame, roi dat vao du 2 line 20 frame (~0.7s) -> CHAY + TAO LOG
         engine.stats.reset()

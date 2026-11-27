@@ -292,9 +292,9 @@ class CnnLaneDetector(object):
         # bao found=False de FSM ha ga / roi ve CV.
         self.reg_disagree = float(c('lane.cnn.reg_disagree', 0.35))
         self.check_reg = bool(c('lane.cnn.check_reg', True))
-        # Option B (3 kenh): neu kenh centerline bi mat/dut, tu suy tam duong tu
-        # mat duong (Ch0 - Ch1) de xe khong mat lai dot ngot.
-        self.road_fallback = bool(c('lane.cnn.road_fallback', True))
+        # Option B (3 kenh): mac dinh False -> chi bam DUNG kenh phan vang (Ch2 centerline)
+        # do model du doan. Bat True chi khi muon du phong suy tam tu Ch0/Ch1.
+        self.road_fallback = bool(c('lane.cnn.road_fallback', False))
 
     def _reset_state(self):
         self._cte = 0.0
