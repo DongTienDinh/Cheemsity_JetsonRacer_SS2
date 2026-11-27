@@ -331,6 +331,7 @@ class CnnLaneDetector(object):
         self.last_right_line = False
         self.last_two_lines_ok = False
         self.last_used_fallback = False
+        self.last_road_turn = 0
         self.last_bev = None         # cung mask do sau khi warp sang BEV
         self.n_disagree = 0
         self.n_fallback = 0
@@ -360,6 +361,7 @@ class CnnLaneDetector(object):
         self.check_reg = bool(c('lane.cnn.check_reg', True))
         # Cac che do du phong Option B tu mat duong Ch0 va bien trang Ch1.
         self.road_fallback = bool(c('lane.cnn.road_fallback', False))
+        self.road_guided = bool(c('lane.cnn.road_guided', False))
         self.single_line_fallback = bool(c('lane.cnn.single_line_fallback', False))
         self.single_line_offset_px = float(c('lane.cnn.single_line_offset_px', 108.0))
 
@@ -742,20 +744,128 @@ class CnnLaneDetector(object):
         curvature = co[0] * t_max * t_max / half
         return tuple(float(np.clip(v, -1.0, 1.0)) for v in (cte, look, curvature))
 
-    def _fit_recovery(self, ego_road, edge, reg_look):
-        if edge is None:
+    def _fit_midpoints(self, ego_road, preview):
+        """Lay trung diem tren nhung hang co du hai mep road thuc su thay duoc."""
+        road = ego_road > 0
+        width = road.sum(axis=1)
+        left = road.argmax(axis=1)
+        right = PROC_W - 1 - road[:, ::-1].argmax(axis=1)
+        rows = np.arange(PROC_H)
+        inside_view = (left >= 3) & (right < PROC_W - 3)
+        inside_view &= (self._bev_visible[rows, np.maximum(0, left - 3)] &
+                        self._bev_visible[rows, np.minimum(PROC_W - 1, right + 3)])
+        # Mot hang giao ca hai nhanh cua chu U co the co nhieu khoang road.
+        valid = inside_view & (width >= 26) & (width == right - left + 1)
+        band_h = PROC_H // N_BANDS
+        ts, xs, npix = [], [], 0
+        for b, t in enumerate(self._band_ts):
+            hi = PROC_H - b * band_h
+            indices = np.flatnonzero(valid[hi - band_h:hi]) + hi - band_h
+            if len(indices) >= 9:
+                ts.append(t)
+                xs.append(float(np.median((left[indices] + right[indices]) * 0.5)))
+                npix += int(len(indices))
+        if len(ts) < max(3, self.min_bands) or ts[0] > 0.35:
             return None
-        fit = self._fit_inward_offset(ego_road, edge)
+        co = self._fit_poly_fast(np.asarray(ts), np.asarray(xs))
+        bev = None
+        if preview:
+            bev = np.zeros_like(ego_road)
+            points = np.column_stack((xs, (1.0 - np.asarray(ts)) * PROC_H))
+            cv2.polylines(bev, [np.rint(points).astype(np.int32)], False, 255, 3)
+        return co, ts[-1], len(ts), npix, bev
+
+    def _road_fit_values(self, ego_road, fit):
         if fit is None:
             return None
         co, t_max = fit[:2]
         t_look = min(self.lookahead, t_max)
         x = int(round(float(np.polyval(co, t_look))))
         y = int(np.clip(round((1.0 - t_look) * PROC_H), 0, PROC_H - 1))
-        if not (0 <= x < PROC_W and ego_road[y, x]):
+        if 0 <= x < PROC_W and ego_road[y, x]:
+            return self._fit_values(co, t_max)
+        return None
+
+    def _fit_road_guide(self, road_logits, preview):
+        ego_road = self._ego_road_bev(road_logits)
+        if ego_road is None:
+            return None, None
+        fit = self._fit_midpoints(ego_road, preview)
+        raw = self._road_fit_values(ego_road, fit)
+        if raw is not None:
+            return fit, raw
+        outside = self._bev_visible & (ego_road == 0)
+        if np.count_nonzero(outside) < 70:
+            return None, None
+        fit = self._fit_inward_offset(ego_road, outside)
+        raw = self._road_fit_values(ego_road, fit)
+        if raw is not None:
+            # Mot mep o xa cho huong ngam, khong du du lieu tinh CTE sat dau xe.
+            raw = (0.0, raw[1], raw[2])
+        return fit, raw
+
+    def _road_turn_direction(self, fit, raw):
+        if raw is None:
+            return 0
+        co, t_max = fit[:2]
+        t_far = min(self.lookahead, t_max)
+        t_near = max(0.0, t_far - 0.35)
+        half = PROC_W / 2.0
+        lateral = (np.polyval(co, t_far) - np.polyval(co, t_near)) / half
+        bend = abs(co[0] * t_far * t_far / half)
+        # Lech sang mot ben chua du: duong con phai doi huong va co do cong.
+        if abs(raw[1]) < 0.22 or bend < 0.05 or abs(lateral) < 0.12 or lateral * raw[1] <= 0.0:
+            return 0
+        return 1 if lateral > 0.0 else -1
+
+    def _cte_disagrees(self, raw, reg):
+        return (raw is not None and self.check_reg and reg is not None and len(reg) >= 1
+                and abs(float(reg[0]) - raw[0]) > self.reg_disagree)
+
+    def _process_road_guided(self, seg3, reg, preview, t0):
+        road_logits, center_logits = seg3[0], seg3[2]
+        self.last_white_mask = self.last_center_mask = None
+        self.last_left_line = self.last_right_line = self.last_two_lines_ok = False
+        self.last_road_mask = self.last_mask = self.last_bev = None
+        co, t_max, n_bands, npix = self._mask_to_fit_lut(center_logits)
+        raw = self._fit_values(co, t_max) if co is not None else None
+        if self._cte_disagrees(raw, reg):
+            self.n_disagree += 1
+            raw = None
+
+        guide, guide_raw = self._fit_road_guide(road_logits, preview)
+        self.last_road_turn = self._road_turn_direction(guide, guide_raw)
+        if self.last_road_turn:
+            wrong_way = (raw is not None and raw[1] * self.last_road_turn <= 0.0
+                         and abs(raw[1] - guide_raw[1]) >= 0.25)
+            if raw is None or wrong_way:
+                co, _, n_bands, npix, self.last_bev = guide
+                # Khong de feed-forward quay nguoc huong mep xanh da xac nhan.
+                curv = guide_raw[2] if guide_raw[2] * self.last_road_turn > 0.0 else 0.0
+                raw = (guide_raw[0], guide_raw[1], curv)
+                self.last_used_fallback = True
+                self.n_fallback += 1
+
+        if preview:
+            self.last_road_mask = (road_logits > 0.0).astype(np.uint8) * 255
+            if self.last_used_fallback:
+                self.last_mask = cv2.warpPerspective(
+                    self.last_bev, self._M_seg, (SEG_W, SEG_H),
+                    flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP)
+            elif raw is not None:
+                self.last_mask = (center_logits > 0.0).astype(np.uint8) * 255
+                self.last_bev = cv2.warpPerspective(
+                    self.last_mask, self._M_seg, (PROC_W, PROC_H), flags=cv2.INTER_NEAREST)
+        else:
+            self.last_bev = None
+        return self._finish_frame(raw, co, n_bands, npix, t0)
+
+    def _fit_recovery(self, ego_road, edge, reg_look):
+        if edge is None:
             return None
-        values = self._fit_values(co, t_max)
-        if values[1] * reg_look <= 0.0 or abs(values[1] - reg_look) > self.reg_disagree:
+        fit = self._fit_inward_offset(ego_road, edge)
+        values = self._road_fit_values(ego_road, fit)
+        if values is None or values[1] * reg_look <= 0.0 or abs(values[1] - reg_look) > self.reg_disagree:
             return None
         return fit, values
 
@@ -802,6 +912,11 @@ class CnnLaneDetector(object):
 
         seg, reg = self._pick_outputs(outs)
         self.last_used_fallback = False
+        self.last_road_turn = 0
+        if self.road_guided:
+            if seg.size != 3 * SEG_H * SEG_W:
+                raise ValueError('lane.cnn.road_guided can model Option B co Ch0 va Ch2')
+            return self._process_road_guided(seg.reshape(3, SEG_H, SEG_W), reg, compute_bev, t0)
         seg3 = None
         # Nguong 0 tren logits == sigmoid > 0.5. Model co y khong co Sigmoid.
         if seg.size == 3 * SEG_H * SEG_W:
@@ -872,8 +987,7 @@ class CnnLaneDetector(object):
                 self.last_bev = None
 
         raw = self._fit_values(co, t_max) if co is not None else None
-        cte_disagree = (raw is not None and self.check_reg and reg is not None
-                        and len(reg) >= 1 and abs(float(reg[0]) - raw[0]) > self.reg_disagree)
+        cte_disagree = self._cte_disagrees(raw, reg)
         if cte_disagree:
             self.n_disagree += 1
 
@@ -892,7 +1006,10 @@ class CnnLaneDetector(object):
                 if compute_bev:
                     self.last_bev = fb_bev
 
-        if raw is None or cte_disagree:
+        return self._finish_frame(None if cte_disagree else raw, co, n_bands, npix, t0)
+
+    def _finish_frame(self, raw, co, n_bands, npix, t0):
+        if raw is None:
             self.last_total_ms = (time.perf_counter() - t0) * 1000.0
             return LaneResult(False, self._cte, self._curv, npix, self.last_bev,
                               cte_lookahead=self._look, n_bands=n_bands)

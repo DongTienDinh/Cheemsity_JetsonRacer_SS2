@@ -468,6 +468,7 @@ class LaneTuningEngine(object):
         servo_clipped = abs(servo_raw - servo) > 1e-6
 
         has_opt_b = getattr(self.lane, 'last_white_mask', None) is not None
+        road_guided = getattr(self.lane, 'road_guided', False)
         two_ok = (bool(getattr(self.lane, 'last_two_lines_ok', False))
                   if has_opt_b else None)
         self.stats.push(res.cte, steer, res.found, res.n_bands,
@@ -486,6 +487,10 @@ class LaneTuningEngine(object):
             result['right_line'] = bool(getattr(self.lane, 'last_right_line', False))
             result['two_lines_ok'] = bool(getattr(self.lane, 'last_two_lines_ok', False))
             result['used_fallback'] = bool(getattr(self.lane, 'last_used_fallback', False))
+        if road_guided:
+            result['road_guided'] = True
+            result['road_turn'] = self.lane.last_road_turn
+            result['used_fallback'] = self.lane.last_used_fallback
         if copy_preview:
             lane_mask = getattr(self.lane, 'last_mask', None)
             if lane_mask is not None:
@@ -493,10 +498,10 @@ class LaneTuningEngine(object):
             road_mask = getattr(self.lane, 'last_road_mask', None)
             white_mask = getattr(self.lane, 'last_white_mask', None)
             center_mask = getattr(self.lane, 'last_center_mask', None)
+            if road_mask is not None:
+                result['_preview_road'] = road_mask.copy()
             if white_mask is not None:
                 result['_preview_white'] = white_mask.copy()
-                if road_mask is not None:
-                    result['_preview_road'] = road_mask.copy()
                 if center_mask is not None:
                     result['_preview_center'] = center_mask.copy()
         return result
@@ -519,11 +524,11 @@ class LaneTuningEngine(object):
         opt_b_white = result.get('_preview_white')
         opt_b_road = result.get('_preview_road')
         opt_b_center = result.get('_preview_center')
+        road_guided = result.get('road_guided', False)
 
-        if opt_b_white is not None and ph > y0:
+        if (opt_b_white is not None or road_guided) and ph > y0:
             # Option B 3 kenh: ve ro mat duong (xanh), 2 line 2 ben (tim), tam ao (vang)
             roi_h = ph - y0
-            w_up = cv2.resize(opt_b_white, (pw, roi_h), interpolation=cv2.INTER_NEAREST)
             r_up = (cv2.resize(opt_b_road, (pw, roi_h), interpolation=cv2.INTER_NEAREST)
                     if opt_b_road is not None else None)
             c_up = (cv2.resize(opt_b_center, (pw, roi_h), interpolation=cv2.INTER_NEAREST)
@@ -540,17 +545,31 @@ class LaneTuningEngine(object):
             if r_up is not None:
                 roi_ov[r_up > 0] = (40, 180, 40)
                 roi_bin[r_up > 0] = (25, 95, 25)
-            roi_ov[w_up > 0] = (240, 50, 235)      # 2 line trang 2 ben -> tim sang
-            roi_bin[w_up > 0] = (255, 70, 255)
+            if opt_b_white is not None:
+                w_up = cv2.resize(opt_b_white, (pw, roi_h), interpolation=cv2.INTER_NEAREST)
+                roi_ov[w_up > 0] = (240, 50, 235)
+                roi_bin[w_up > 0] = (255, 70, 255)
             if c_draw is not None:
                 roi_ov[c_draw > 0] = (0, 230, 255) # tam duong -> vang tuoi
                 roi_bin[c_draw > 0] = (0, 235, 255)
             overlay = cv2.addWeighted(ov, 0.50, proc, 0.50, 0)
             cv2.line(overlay, (0, y0), (pw, y0), (0, 255, 255), 1)
             cv2.line(binary, (0, y0), (pw, y0), (70, 70, 70), 1)
-            _label(overlay, 'CAMERA + 2 LINE (TIM) + TAM (VANG)')
-            if result.get('used_fallback'):
+            _label(overlay, 'MAT DUONG (XANH) + TAM (VANG)' if road_guided
+                   else 'CAMERA + 2 LINE (TIM) + TAM (VANG)')
+            if road_guided and result.get('used_fallback'):
+                side = 'PHAI' if result.get('road_turn', 0) > 0 else 'TRAI'
+                tag_txt, tag_col = 'TAM TU MEP XANH - CUA %s' % side, (0, 220, 255)
+            elif result.get('used_fallback'):
                 tag_txt, tag_col = 'DANG DUNG TAM DU PHONG', (0, 220, 255)
+            elif road_guided:
+                turn = result.get('road_turn', 0)
+                if turn:
+                    tag_txt, tag_col = ('MEP XANH BAO CUA %s' % ('PHAI' if turn > 0 else 'TRAI'),
+                                        (0, 220, 255))
+                else:
+                    tag_txt, tag_col = ('BAM TAM VANG', (60, 230, 60)) if res.found else (
+                        'CHUA CO TAM DUONG', (60, 60, 255))
             elif result.get('two_lines_ok'):
                 tag_txt, tag_col = '2 LINE: DU TRAI+PHAI', (60, 230, 60)
             elif result.get('left_line') or result.get('right_line'):
@@ -721,7 +740,10 @@ def _draw_banner(panel, res, result, fps, armed, driver_kind='dryrun',
                  else 'LAI TAY (DRYRUN - banh khong quay)')
         colour = (255, 160, 60)
     elif not armed:
-        if result.get('_preview_white') is not None:
+        if result.get('road_guided'):
+            state, colour = (('CO TAM DUONG', (80, 235, 80)) if res.found else
+                             ('CHO TAM DUONG ON DINH', (0, 200, 255)))
+        elif result.get('_preview_white') is not None:
             if result.get('two_lines_ok'):
                 state, colour = 'SAN SANG CHAY (2 LINE OK - bam CHAY)', (80, 235, 80)
             else:
@@ -2117,7 +2139,7 @@ class LaneTuningUI(object):
         #    - Option B (3 kenh): CHI yeu cau nhan du 2 VACH LINE 2 BEN (trai + phai)
         #      luc xuat phat. Khi da bam CHAY la chay thong theo phan vang (Ch2),
         #      khong kiem tra dieu kien 2 line nua.
-        #    - CV / CNN 1 kenh cu: kiem tra ty le mat vach tren 20 frame gan nhat.
+        #    - Mep xanh huong dan, CV, CNN 1 kenh cu: kiem tra mat tam 20 frame gan nhat.
         if getattr(self.engine.lane, 'last_white_mask', None) is not None:
             two_pct = self.engine.stats.recent_two_lines_pct(15)
             if two_pct < 60.0:

@@ -2052,9 +2052,68 @@ def test_lane_cnn_recovery_prioritizes_visible_road_edge():
     assert not run(one_boundary, -0.33).found and not det.last_used_fallback
 
 
+def test_lane_cnn_road_edges_guide_yellow_without_white():
+    from jetracer_baseline.perception.lane_cnn import (
+        CnnLaneDetector, PROC_H, PROC_W, SEG_H, SEG_W)
+
+    cfg = load_config(CONFIG, [os.path.join(ROOT, 'configs', name) for name in (
+        'cnn_option_b_fast.yaml', 'road_guided.yaml')])
+    cfg.set('lane.cnn.engine', '')
+    det = CnnLaneDetector(cfg)
+    assert det.road_guided
+    det._M_seg = np.diag([PROC_W / float(SEG_W), PROC_H / float(SEG_H), 1.0])
+    det._build_bev_lut()
+    frame = np.zeros((PROC_H, PROC_W, 3), dtype=np.uint8)
+
+    class FakeEngine(object):
+        def infer(self, _x):
+            return {'seg': self.seg, 'reg': self.reg}
+
+    det.engine = FakeEngine()
+    seg = np.full((3, SEG_H, SEG_W), -5.0, dtype=np.float32)
+    for y in range(SEG_H):
+        t = (SEG_H - 1 - y) / float(SEG_H - 1)
+        edge = int(round(18 + 70.0 * t * t))
+        seg[0, y, edge + 2:] = 5.0
+    det.engine.seg = seg
+    det.engine.reg = np.zeros(3, dtype=np.float32)
+    before = det.process(frame, need_aux=False)
+    assert before.found and before.cte_lookahead > 0.20
+    assert det.last_road_turn == 1 and det.last_used_fallback
+
+    seg[1, :, :9] = 10.0
+    det.reset()
+    after = det.process(frame, compute_bev=True)
+    assert (after.found, after.cte, after.cte_lookahead, after.curvature) == (
+        before.found, before.cte, before.cte_lookahead, before.curvature)
+    assert det.last_white_mask is None and det.last_center_mask is None
+    assert after.debug.any() and det.last_mask.any()
+
+    seg[2, :, 20:24] = 10.0
+    det.engine.reg[0] = -0.65
+    det.reset()
+    assert det.process(frame).cte_lookahead > 0.20 and det.last_used_fallback
+
+    seg[2] = -5.0
+    for y in range(SEG_H):
+        t = (SEG_H - 1 - y) / float(SEG_H - 1)
+        x = int(round(64 + 48.0 * t * t))
+        seg[2, y, x - 2:x + 3] = 5.0
+    det.engine.reg[0] = 0.0
+    det.reset()
+    assert det.process(frame).found and not det.last_used_fallback and det.last_road_turn == 1
+
+    # Ch0 phu kin tam nhin: vien anh khong the dung lam mep duong.
+    seg[0] = 5.0
+    seg[2] = -5.0
+    det.reset()
+    assert not det.process(frame).found
+
+
 def test_speed_track_ui_option_b_panel_and_recent_run_gate():
-    """Giao dien Speed Track hien 2 line Option B va cho bam CHAY ngay khi dat vao 2 line."""
-    from jetracer_baseline.perception.lane_cnn import CnnLaneDetector, SEG_H, SEG_W
+    """Giao dien Speed Track chi kiem tra vach trang trong profile Option B thuong."""
+    from jetracer_baseline.perception.lane_cnn import (
+        CnnLaneDetector, PROC_H, PROC_W, SEG_H, SEG_W)
 
     # 1. RollingStats.recent_loss_pct: 100 frame mat vach luc be xe + 20 frame
     # thay vach gan nhat -> recent_loss_pct phai la 0%, khong chan nut CHAY.
@@ -2162,6 +2221,22 @@ def test_speed_track_ui_option_b_panel_and_recent_run_gate():
         assert ui._logger is not None and os.path.isfile(ui._logger.path)
         ui._disarm_locked('stop')
         assert not ui._armed
+
+        # Mep xanh huong dan: yeu cau tam on dinh, doc lap voi trang thai 2 vach.
+        det.road_guided = True
+        det._M_seg = np.diag([PROC_W / float(SEG_W), PROC_H / float(SEG_H), 1.0])
+        det._build_bev_lut()
+        engine.stats.reset()
+        for _ in range(5):
+            result = engine.process(frame, 1.0 / 30.0)
+        assert result['road_guided'] and result['lane'].found
+        assert result['_preview_road'].any() and result['_preview_mask'].any()
+        assert '_preview_white' not in result
+        panel = engine.render_panel(result, fps=30.0, armed=False, driver_kind='dryrun')
+        assert panel.shape[2] == 3
+        ui._on_run_locked()
+        assert ui._armed and ui.mode == MODE_AUTO
+        ui._disarm_locked('stop')
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
