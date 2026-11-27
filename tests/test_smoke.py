@@ -2165,6 +2165,44 @@ def test_speed_track_ui_option_b_panel_and_recent_run_gate():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def test_camera_open_timeout_does_not_block_ui_or_install_late_capture():
+    from jetracer_baseline import tuning_ui as tuning_ui_mod
+
+    ui = LaneTuningUI.__new__(LaneTuningUI)
+    ui._thread = ui._grabber = ui._camera_open_ticket = None
+    ui._camera_stopping = threading.Event()
+    ui._lifecycle_lock = threading.RLock()
+    ui._camera_open_timeout_s = 0.10
+    ui.source_kind, ui.video_path = 'csi', None
+    ui.engine = types.SimpleNamespace(cfg=None)
+    ui._log = ui._set_status = lambda _msg: None
+    timeout = threading.Event()
+    ui._set_error_status = lambda _msg: timeout.set()
+    opening, return_source, released = (threading.Event() for _ in range(3))
+    calls = []
+
+    def slow_camera(_cfg, _kind, video_path=None):
+        calls.append(1)
+        opening.set()
+        return_source.wait(2.0)
+        return types.SimpleNamespace(release=released.set)
+
+    build_source = tuning_ui_mod.build_source
+    tuning_ui_mod.build_source = slow_camera
+    try:
+        ui._on_open()
+        assert opening.wait(1.0)
+        assert timeout.wait(1.0)
+        assert not released.is_set()
+        ui._on_open()
+        assert len(calls) == 1 and ui._grabber is None
+    finally:
+        return_source.set()
+        tuning_ui_mod.build_source = build_source
+    assert released.wait(1.0)
+    assert ui._grabber is None
+
+
 def test_run_start_survives_slow_driver_init_and_first_frame_latency():
     """Mo phong dung loi Jetson Nano 5W: driver init cham + inference ~100ms.
 

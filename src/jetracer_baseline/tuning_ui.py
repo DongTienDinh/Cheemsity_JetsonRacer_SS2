@@ -783,6 +783,8 @@ def _dict_diff(base, current):
 
 # ============================================================== lop widget UI
 class LaneTuningUI(object):
+    _camera_open_timeout_s = 10.0
+
     """Giao dien Jupyter noi slider vao LaneTuningEngine."""
 
     def __init__(self, config_path='configs/default.yaml', source_kind='csi',
@@ -823,6 +825,7 @@ class LaneTuningUI(object):
         self._armed = False
         self._stop_event = threading.Event()
         self._camera_stopping = threading.Event()
+        self._camera_open_ticket = None
         self._thread = None
         self._driver_lock = threading.Lock()
         # Bao ve chuyen trang thai camera/ARM/log giua callback Jupyter va
@@ -2022,31 +2025,82 @@ class LaneTuningUI(object):
         if self._grabber is not None:
             self._log('Camera dang mo.')
             return
+        if self._camera_open_ticket is not None:
+            self._log('Lan mo camera truoc chua ket thuc.')
+            return
+        ticket = threading.Event()
+        self._camera_open_ticket = ticket
+        self._set_status('dang mo nguon camera')
+        self._log('Dang mo camera kind=%s, %s'
+                  % (self.source_kind, format_camera_environment()))
+        timeout = self._camera_open_timeout_s
+        timer = threading.Timer(timeout, self._camera_open_timeout, args=(ticket,))
+        timer.daemon = True
+        worker = threading.Thread(target=self._open_camera_worker, args=(ticket, timer))
+        worker.daemon = True
+        timer.start()
+        worker.start()
+
+    def _camera_open_timeout(self, ticket):
+        with self._lifecycle_lock:
+            if self._camera_open_ticket is not ticket or ticket.is_set():
+                return
+            ticket.set()
+            message = 'Camera chua san sang sau %.0f s. Kiem tra kernel dung camera va log Argus.' % (
+                self._camera_open_timeout_s,)
+            self._set_error_status(message)
+            self._log(message)
+
+    def _open_camera_worker(self, ticket, timer):
+        # VideoCapture() va read() co the cho Argus rat lau. Chua giu khoa UI.
         source = None
         grabber = None
+        installed = False
         try:
-            self._log('Dang mo camera kind=%s, %s'
-                      % (self.source_kind, format_camera_environment()))
             source = build_source(self.engine.cfg, self.source_kind,
                                   video_path=self.video_path)
-            grabber = LatestFrameGrabber(source).start()
+            with self._lifecycle_lock:
+                if ticket.is_set():
+                    return
+                self._set_status('da mo nguon camera, dang doi frame dau tien')
+                self._log('Da mo nguon %s, dang doi frame dau tien.' %
+                          getattr(source, 'backend', self.source_kind))
+            grabber = LatestFrameGrabber(source)
+            grabber.start()
             if grabber.error is not None:
                 raise RuntimeError(grabber.error)
+            if grabber.peek()[0] is None:
+                raise RuntimeError('Nguon camera da mo nhung khong co frame.')
+            with self._lifecycle_lock:
+                if ticket.is_set():
+                    return
+                self._start_camera_loop_locked(grabber)
+                installed = True
+                ticket.set()
+                timer.cancel()
+                self._set_status('camera dang chay (chua ARM - xe khong chay)')
+                self._log('Camera OK, backend=%s' % getattr(source, 'backend', self.source_kind))
         except Exception as exc:
-            if grabber is not None:
+            with self._lifecycle_lock:
+                if not ticket.is_set():
+                    ticket.set()
+                    self._set_error_status('KHONG MO DUOC CAMERA: %s' % exc)
+                    self._log('Loi mo camera: %s' % exc)
+        finally:
+            timer.cancel()
+            if not installed:
                 try:
-                    grabber.stop()
+                    if grabber is not None:
+                        grabber.stop()
+                    elif source is not None:
+                        source.release()
                 except Exception:
                     pass
-            elif source is not None:
-                try:
-                    source.release()
-                except Exception:
-                    pass
-            self._set_error_status('KHONG MO DUOC CAMERA: %s' % exc)
-            self._log('Loi mo camera: %s' % exc)
-            return
+            with self._lifecycle_lock:
+                if self._camera_open_ticket is ticket:
+                    self._camera_open_ticket = None
 
+    def _start_camera_loop_locked(self, grabber):
         try:
             self._grabber = grabber
             self._camera_stop_reason = None
@@ -2062,19 +2116,10 @@ class LaneTuningUI(object):
             self._thread = threading.Thread(target=self._loop, args=(grabber,))
             self._thread.daemon = True
             self._thread.start()
-        except Exception as exc:
+        except Exception:
             self._camera_stopping.set()
             self._grabber = None
-            try:
-                grabber.stop()
-            except Exception:
-                pass
-            self._set_error_status('KHONG KHOI DONG DUOC THREAD CAMERA: %s' % exc)
-            self._log('Loi khoi dong vong camera: %s' % exc)
-            return
-        self._set_status('camera dang chay (chua ARM - xe khong chay)')
-        self._log('Camera OK, backend=%s'
-                  % getattr(source, 'backend', self.source_kind))
+            raise
 
     def _on_run(self, _b=None):
         with self._lifecycle_lock:
@@ -2510,8 +2555,11 @@ class LaneTuningUI(object):
         return self
 
     def close(self):
-        self._camera_stopping.set()
-        self._stop_event.set()
+        with self._lifecycle_lock:
+            self._camera_stopping.set()
+            self._stop_event.set()
+            if self._camera_open_ticket is not None:
+                self._camera_open_ticket.set()
         self._control_stop.set()
         self._preview_stop.set()
         self._preview_event.set()
