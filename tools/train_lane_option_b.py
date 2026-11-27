@@ -58,6 +58,102 @@ def _build_bev_matrix(w, h):
 BEV_MAT_PROC = _build_bev_matrix(PROC_W, PROC_H)
 
 
+class _GpuBevLut(object):
+    """Tinh chinh xac reg [cte, cte_lookahead, curvature] tu mask centerline 64x128 tren GPU.
+
+    Dung DUNG ma tran BEV-LUT nhu `lane_cnn.py` khi chay tren Jetson Nano ->
+    sau moi phep dich ngang / xoay / scale trong `augment_batch_gpu`, nhan reg
+    van khop 100% voi duong tam moi thay vi uoc luong gan dung `br + tx`.
+    """
+
+    def __init__(self, device):
+        roi_y0 = int(PROC_H * ROI_TOP)
+        roi_h = max(1, PROC_H - roi_y0)
+        seg_to_proc = np.array([
+            [PROC_W / float(SEG_W), 0.0, 0.0],
+            [0.0, roi_h / float(SEG_H), float(roi_y0)],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+        m_seg = BEV_MAT_PROC.dot(seg_to_proc)
+        m_inv = np.linalg.inv(m_seg)
+        yy, xx = np.mgrid[0:PROC_H, 0:PROC_W]
+        denom = m_inv[2, 0] * xx + m_inv[2, 1] * yy + m_inv[2, 2]
+        denom = np.where(np.abs(denom) < 1e-9, 1e-9, denom)
+        sx = np.rint((m_inv[0, 0] * xx + m_inv[0, 1] * yy + m_inv[0, 2]) / denom).astype(np.int32)
+        sy = np.rint((m_inv[1, 0] * xx + m_inv[1, 1] * yy + m_inv[1, 2]) / denom).astype(np.int32)
+        valid = (sx >= 0) & (sx < SEG_W) & (sy >= 0) & (sy < SEG_H)
+        n_bands = 10
+        band_h = max(1, PROC_H // n_bands)
+        band_id = np.clip((PROC_H - 1 - yy) // band_h, 0, n_bands - 1)
+        flat_s = (sy[valid] * SEG_W + sx[valid]).astype(np.int32)
+        b_v = band_id[valid].astype(np.int32)
+        x_v = xx[valid].astype(np.float64)
+
+        n_pix = SEG_H * SEG_W
+        w_mat = np.zeros((n_bands, n_pix), dtype=np.float32)
+        wx_mat = np.zeros((n_bands, n_pix), dtype=np.float32)
+        for b in range(n_bands):
+            sel = (b_v == b)
+            if sel.any():
+                w_mat[b] = np.bincount(flat_s[sel], minlength=n_pix).astype(np.float32)
+                wx_mat[b] = np.bincount(flat_s[sel], weights=x_v[sel], minlength=n_pix).astype(np.float32)
+        self.w_t = torch.from_numpy(w_mat.T).to(device)      # (8192, 10)
+        self.wx_t = torch.from_numpy(wx_mat.T).to(device)    # (8192, 10)
+        self.ts = torch.tensor([(b + 0.5) / float(n_bands) for b in range(n_bands)],
+                               dtype=torch.float32, device=device)
+
+    @torch.no_grad()
+    def compute_batch(self, center_mask_bchw):
+        """center_mask_bchw: (B, 64, 128) -> (reg (B,3), reg_valid (B,) bool)."""
+        B = center_mask_bchw.shape[0]
+        cm = (center_mask_bchw > 0.5).float().reshape(B, -1)
+        w_band = cm.matmul(self.w_t)
+        wx_band = cm.matmul(self.wx_t)
+        ok = w_band >= 8.0
+        n_ok = ok.sum(dim=1)
+        reg_valid = n_ok >= 2
+
+        m = ok.float()
+        xs = wx_band / w_band.clamp(min=1.0)
+        t = self.ts.unsqueeze(0)        # (1, 10)
+        t2 = t * t
+        s0 = m.sum(dim=1)
+        s1 = (m * t).sum(dim=1)
+        s2 = (m * t2).sum(dim=1)
+        s3 = (m * t2 * t).sum(dim=1)
+        s4 = (m * t2 * t2).sum(dim=1)
+        y0 = (m * xs).sum(dim=1)
+        y1 = (m * t * xs).sum(dim=1)
+        y2 = (m * t2 * xs).sum(dim=1)
+
+        # Fit bac 2 cho mau >= 3 band (them regularization nho chong suy bien)
+        eye3 = torch.eye(3, device=cm.device, dtype=torch.float32).unsqueeze(0) * 1e-4
+        a3 = torch.stack([
+            torch.stack([s4, s3, s2], dim=1),
+            torch.stack([s3, s2, s1], dim=1),
+            torch.stack([s2, s1, s0], dim=1),
+        ], dim=1) + eye3
+        b3 = torch.stack([y2, y1, y0], dim=1)
+        co3 = torch.linalg.solve(a3, b3)
+
+        # Fit bac 1 cho mau chi co dung 2 band
+        d2 = (s0 * s2 - s1 * s1).clamp(min=1e-5)
+        c1_lin = (s0 * y1 - s1 * y0) / d2
+        c2_lin = (y0 - c1_lin * s1) / s0.clamp(min=1.0)
+        co2 = torch.stack([torch.zeros_like(c1_lin), c1_lin, c2_lin], dim=1)
+        co = torch.where((n_ok >= 3).unsqueeze(1), co3, co2)
+
+        t_max = (m * t).max(dim=1).values
+        t_look = torch.clamp(t_max, max=0.60)
+        half = PROC_W / 2.0
+        cte = torch.clamp((co[:, 2] - half) / half, -1.0, 1.0)
+        look = torch.clamp(((co[:, 0] * t_look + co[:, 1]) * t_look + co[:, 2] - half) / half, -1.0, 1.0)
+        curv = torch.clamp((co[:, 0] * t_max * t_max) / half, -1.0, 1.0)
+        reg = torch.stack([cte, look, curv], dim=1)
+        reg = torch.where(reg_valid.unsqueeze(1), reg, torch.zeros_like(reg))
+        return reg, reg_valid
+
+
 def compute_reg_from_centerline_mask(center_mask_640x480):
     """Tinh [cte, cte_lookahead, curvature] tu mask centerline 640x480 theo dung duong BEV."""
     small = cv2.resize(center_mask_640x480, (PROC_W, PROC_H), interpolation=cv2.INTER_NEAREST)
@@ -443,8 +539,12 @@ MODEL_REGISTRY = {
 # DATA LOADING & AUGMENTATION
 # =============================================================================
 
-def augment_batch_gpu(bx, by, br):
-    """Augmentation 100% tren GPU CUDA (nhanh hon ~20x so voi vong lap CPU OpenCV)."""
+def augment_batch_gpu(bx, by, bv, br, bev_lut=None):
+    """Augmentation 100% tren GPU CUDA, co valid_mask va tinh lai reg chinh xac.
+
+    Dich ngang manh (tx trong [-0.28, +0.28]) pha bo duong tat CoordConv
+    (tranh viec model ghim duong tam o giua anh khi xe bi lech sat vach trang).
+    """
     B = bx.shape[0]
     dev = bx.device
 
@@ -453,18 +553,20 @@ def augment_batch_gpu(bx, by, br):
     if flip_mask.any():
         bx = bx.clone()
         by = by.clone()
+        bv = bv.clone()
         br = br.clone()
         bx[flip_mask] = torch.flip(bx[flip_mask], dims=[3])
         by[flip_mask] = torch.flip(by[flip_mask], dims=[3])
+        bv[flip_mask] = torch.flip(bv[flip_mask], dims=[3])
         br[flip_mask] = -br[flip_mask]
 
-    # 2. Random affine tren GPU (xoay +-6 deg, scale 0.93..1.07, dich ngang/doc)
-    aff_mask = torch.rand(B, device=dev) < 0.60
+    # 2. Random affine manh tren GPU (xoay +-8 deg, scale 0.92..1.08, dich ngang +-28%)
+    aff_mask = torch.rand(B, device=dev) < 0.85
     if aff_mask.any():
-        angles = (torch.rand(B, device=dev) * 12.0 - 6.0) * (np.pi / 180.0)
-        scales = torch.rand(B, device=dev) * 0.14 + 0.93
-        tx = torch.rand(B, device=dev) * 0.10 - 0.05
-        ty = torch.rand(B, device=dev) * 0.06 - 0.03
+        angles = (torch.rand(B, device=dev) * 16.0 - 8.0) * (np.pi / 180.0)
+        scales = torch.rand(B, device=dev) * 0.16 + 0.92
+        tx = torch.rand(B, device=dev) * 0.56 - 0.28
+        ty = torch.rand(B, device=dev) * 0.08 - 0.04
         angles = torch.where(aff_mask, angles, torch.zeros_like(angles))
         scales = torch.where(aff_mask, scales, torch.ones_like(scales))
         tx = torch.where(aff_mask, tx, torch.zeros_like(tx))
@@ -484,9 +586,13 @@ def augment_batch_gpu(bx, by, br):
         grid_y = F.affine_grid(theta, by.size(), align_corners=False)
         bx = F.grid_sample(bx, grid_x, mode='bilinear', padding_mode='border', align_corners=False)
         by = F.grid_sample(by, grid_y, mode='nearest', padding_mode='zeros', align_corners=False)
-        br = br.clone()
-        br[:, 0] = torch.clamp(br[:, 0] + tx, -1.0, 1.0)
-        br[:, 1] = torch.clamp(br[:, 1] + tx, -1.0, 1.0)
+        bv = F.grid_sample(bv, grid_y, mode='nearest', padding_mode='zeros', align_corners=False)
+
+    # Tinh lai reg ground truth TRUC TIEP tu mask centerline sau bien doi (chinh xac 100%)
+    if bev_lut is not None:
+        br, reg_valid = bev_lut.compute_batch(by[:, 2])
+    else:
+        reg_valid = torch.ones(B, dtype=torch.bool, device=dev)
 
     # 3. Photometric jitter (do sang, tuong phan, can bang trang)
     alpha = (torch.rand((B, 1, 1, 1), device=dev) * 0.70 + 0.65)
@@ -521,22 +627,92 @@ def augment_batch_gpu(bx, by, br):
         strength = torch.rand((B, 1, 1, 1), device=dev) * 85.0 + 45.0
         bx = torch.clamp(bx + torch.where(gl_mask, blob * strength, torch.zeros_like(blob)), 0.0, 255.0)
 
-    return bx, by, br
+    # 6. Synthetic vach START trang ben trong mat duong den (12%): giup model khong
+    #    cat lo tren Ch0 (road) khi xe dung/chay qua vach "START ->" cua sa ban chinh thuc.
+    st_mask = (torch.rand(B, device=dev) < 0.12).view(B, 1, 1, 1)
+    if st_mask.any():
+        # Erode road mask o 64x128 roi upsample len 128x256 de vach gia CHI nam ben trong long duong
+        road_inner = 1.0 - F.max_pool2d(1.0 - by[:, 0:1], kernel_size=7, stride=1, padding=3)
+        road_hi = F.interpolate(road_inner, size=(IN_H, IN_W), mode='nearest')
+        ys = torch.linspace(0.0, 1.0, IN_H, device=dev).view(1, 1, IN_H, 1)
+        bar_y = torch.rand((B, 1, 1, 1), device=dev) * 0.55 + 0.25
+        bar_h = torch.rand((B, 1, 1, 1), device=dev) * 0.04 + 0.025
+        bar = ((torch.abs(ys - bar_y) <= bar_h).float() * road_hi)
+        val = torch.rand((B, 1, 1, 1), device=dev) * 55.0 + 190.0
+        paint = st_mask.float() * bar
+        bx = bx * (1.0 - paint) + val * paint
+
+    return bx, by, bv, br, reg_valid
 
 
-def multitask_loss(seg_logits, reg_pred, seg_gt, reg_gt):
+def prepare_item(fid, img, r, w, c, valid_mask=None):
+    """Anh 640x480 + 3 mask -> input ROI 256x128, mask 64x128, valid 1x64x128, reg tu centerline."""
+    img_roi = cv2.resize(img[ROI_Y0:, :, :], (IN_W, IN_H), interpolation=cv2.INTER_AREA)
+    m_r = (cv2.resize(r[ROI_Y0:, :], (SEG_W, SEG_H), interpolation=cv2.INTER_AREA) > 127).astype(np.float32)
+    m_w = (cv2.resize(w[ROI_Y0:, :], (SEG_W, SEG_H), interpolation=cv2.INTER_AREA) > 64).astype(np.float32)
+    m_c = (cv2.resize(c[ROI_Y0:, :], (SEG_W, SEG_H), interpolation=cv2.INTER_AREA) > 64).astype(np.float32)
+    if valid_mask is None:
+        m_v = np.ones((1, SEG_H, SEG_W), dtype=np.float32)
+    else:
+        m_v = (cv2.resize(valid_mask[ROI_Y0:, :], (SEG_W, SEG_H), interpolation=cv2.INTER_NEAREST) > 127).astype(np.float32)[None, :, :]
+    return {
+        'id': fid,
+        'full_img': img,
+        'img': img_roi,
+        'masks': np.stack([m_r, m_w, m_c], axis=0),
+        'valid': m_v,
+        'reg': compute_reg_from_centerline_mask(c),
+    }
+
+
+def geo_augment(img, masks, H_bev, dx_bev, yaw_deg, car_pt):
+    """Gia lap xe lech ngang `dx_bev` px va lech huong `yaw_deg` tren mat phang duong.
+
+    Dung BORDER_REPLICATE cho anh + BORDER_CONSTANT(0) cho mask + tra ve `valid_mask`
+    de vung nam ngoai khung hinh goc KHONG sinh phan chieu ao va KHONG gay nhieu loss.
+    """
+    a = np.radians(yaw_deg)
+    cx, cy = car_pt
+    ca, sa = np.cos(a), np.sin(a)
+    T = np.array([[ca, -sa, cx - ca * cx + sa * cy + dx_bev],
+                  [sa, ca, cy - sa * cx - ca * cy],
+                  [0.0, 0.0, 1.0]])
+    M = np.linalg.inv(H_bev).dot(T).dot(H_bev)
+    h, w = img.shape[:2]
+    out = cv2.warpPerspective(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    outs = [cv2.warpPerspective(m, M, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            for m in masks]
+    valid = cv2.warpPerspective(np.full((h, w), 255, dtype=np.uint8), M, (w, h),
+                                flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return (out,) + tuple(outs) + (valid,)
+
+
+def multitask_loss(seg_logits, reg_pred, seg_gt, reg_gt, valid_mask=None, reg_valid=None):
     ch_w = torch.tensor([1.0, 2.0, 2.5], dtype=seg_logits.dtype, device=seg_logits.device).view(1, 3, 1, 1)
-    bce = (F.binary_cross_entropy_with_logits(seg_logits, seg_gt, reduction='none') * ch_w).mean()
-
+    bce_map = F.binary_cross_entropy_with_logits(seg_logits, seg_gt, reduction='none') * ch_w
     probs = torch.sigmoid(seg_logits)
-    inter = (probs * seg_gt).sum(dim=(0, 2, 3))
-    denom = probs.sum(dim=(0, 2, 3)) + seg_gt.sum(dim=(0, 2, 3)) + 1e-5
+
+    if valid_mask is not None:
+        v = valid_mask
+        bce = (bce_map * v).sum() / (v.sum() * ch_w.sum() + 1e-5)
+        inter = (probs * seg_gt * v).sum(dim=(0, 2, 3))
+        denom = (probs * v).sum(dim=(0, 2, 3)) + (seg_gt * v).sum(dim=(0, 2, 3)) + 1e-5
+    else:
+        bce = bce_map.mean()
+        inter = (probs * seg_gt).sum(dim=(0, 2, 3))
+        denom = probs.sum(dim=(0, 2, 3)) + seg_gt.sum(dim=(0, 2, 3)) + 1e-5
+
     dice_per_c = 1.0 - (2.0 * inter + 1e-5) / denom
     cw = torch.tensor([1.0, 2.0, 2.5], dtype=seg_logits.dtype, device=seg_logits.device)
     dice = (dice_per_c * cw).sum() / cw.sum()
 
     seg_loss = 0.5 * bce + 0.5 * dice
-    reg_loss = F.smooth_l1_loss(reg_pred, reg_gt, beta=0.1)
+    if reg_valid is not None and reg_valid.any():
+        reg_loss = F.smooth_l1_loss(reg_pred[reg_valid], reg_gt[reg_valid], beta=0.1)
+    elif reg_valid is not None:
+        reg_loss = torch.zeros((), dtype=seg_logits.dtype, device=seg_logits.device)
+    else:
+        reg_loss = F.smooth_l1_loss(reg_pred, reg_gt, beta=0.1)
     return seg_loss + 0.35 * reg_loss
 
 
@@ -696,6 +872,11 @@ def main():
     parser.add_argument('--export-onnx', action='store_true', help='Chi xuat .onnx khi duoc bat (mac dinh tat luc benchmark)')
     parser.add_argument('--resume', action='store_true', help='Bo qua model da co .pt trong out-dir')
     parser.add_argument('--visual-out', default=None)
+    parser.add_argument('--geo-aug', type=int, default=2,
+                        help='So ban sao lech lan/huong (homography BEV) moi frame train; 0 = tat')
+    parser.add_argument('--geo-shift', type=float, default=22.0,
+                        help='Lech ngang toi da (BEV px cua metadata; nua lan ~55 px)')
+    parser.add_argument('--geo-yaw', type=float, default=6.0, help='Lech huong toi da (do)')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -743,36 +924,52 @@ def main():
         r = cv2.imread(os.path.join(data_dir, 'masks', 'road', fid + '.png'), 0)
         w = cv2.imread(os.path.join(data_dir, 'masks', 'white', fid + '.png'), 0)
         c = cv2.imread(os.path.join(data_dir, 'masks', 'centerline', fid + '.png'), 0)
-
-        img_roi = cv2.resize(img[ROI_Y0:, :, :], (IN_W, IN_H), interpolation=cv2.INTER_AREA)
-        m_r = (cv2.resize(r[ROI_Y0:, :], (SEG_W, SEG_H), interpolation=cv2.INTER_AREA) > 127).astype(np.float32)
-        m_w = (cv2.resize(w[ROI_Y0:, :], (SEG_W, SEG_H), interpolation=cv2.INTER_AREA) > 64).astype(np.float32)
-        m_c = (cv2.resize(c[ROI_Y0:, :], (SEG_W, SEG_H), interpolation=cv2.INTER_AREA) > 64).astype(np.float32)
-        reg = compute_reg_from_centerline_mask(c)
-
-        all_items.append({
-            'id': fid,
-            'full_img': img,
-            'img': img_roi,
-            'masks': np.stack([m_r, m_w, m_c], axis=0),
-            'reg': reg,
-        })
+        item = prepare_item(fid, img, r, w, c)
+        item['raw'] = (r, w, c)
+        all_items.append(item)
     print('Nap xong trong %.1fs.' % (time.time() - t_load))
 
     train_items = [all_items[i] for i in splits['train']]
     val_items = [all_items[i] for i in splits['val']]
     test_items = [all_items[i] for i in splits['test']]
 
-    # Dua san tap train len GPU (603 anh 256x128 chi ton ~230 MB VRAM / 4 GB -> train cuc nhanh!)
+    # Du lieu thu tren sa ban gan nhu luon o GIUA lan (|cte| p95 ~ 0.1) -> model
+    # chua tung thay canh xe sat vach trang, dung luc can no nhat. Sinh them
+    # mau "lech lan / lech huong" dung hinh hoc mat phang (homography BEV) cho
+    # rieng tap TRAIN. Val/Test giu nguyen anh that.
+    if args.geo_aug > 0:
+        t_aug = time.time()
+        H_lab = cv2.getPerspectiveTransform(np.float32(meta['bev_src']), np.float32(meta['bev_dst']))
+        car_pt = (float(meta['bev_width']) / 2.0, float(meta['bev_height']) - 2.0)
+        rng = np.random.RandomState(args.seed)
+        extra = []
+        for it in train_items:
+            r, w, c = it['raw']
+            for _ in range(args.geo_aug):
+                dx = rng.uniform(-args.geo_shift, args.geo_shift)
+                yaw = rng.uniform(-args.geo_yaw, args.geo_yaw)
+                gi, gr, gw, gc, gv = geo_augment(it['full_img'], (r, w, c), H_lab, dx, yaw, car_pt)
+                if np.count_nonzero(gr[ROI_Y0:]) < 2000:
+                    continue
+                extra.append(prepare_item(it['id'] + '_geo', gi, gr, gw, gc, valid_mask=gv))
+        train_items = train_items + extra
+        print('Geo-aug: +%d mau lech lan/huong (shift +-%.0f BEV px, yaw +-%.0f deg) trong %.1fs -> Train=%d' % (
+            len(extra), args.geo_shift, args.geo_yaw, time.time() - t_aug, len(train_items)))
+
+    # Dua san tap train len GPU dang uint8 (doi sang float32 theo tung batch).
     train_x_all = torch.from_numpy(
-        np.stack([it['img'].transpose(2, 0, 1).astype(np.float32) for it in train_items], axis=0)
+        np.stack([it['img'].transpose(2, 0, 1) for it in train_items], axis=0)
     ).to(device)
     train_y_all = torch.from_numpy(
         np.stack([it['masks'] for it in train_items], axis=0)
     ).to(device)
+    train_v_all = torch.from_numpy(
+        np.stack([it['valid'] for it in train_items], axis=0)
+    ).to(device)
     train_r_all = torch.from_numpy(
         np.stack([it['reg'] for it in train_items], axis=0)
     ).to(device)
+    bev_lut = _GpuBevLut(device)
     # Profiler do tren RTX 3050 Ti + torch 2.11+cu128: FP32 nhanh hon AMP FP16 4.5x voi Depthwise Conv!
     # (Khi deploy len Jetson Nano van build TensorRT FP16 binh thuong tu file .onnx.)
     results_path = os.path.join(out_dir, 'benchmark_results.json')
@@ -825,11 +1022,13 @@ def main():
                 bidx = perm[st:st + args.batch_size]
                 if len(bidx) < 4:
                     continue
-                bx, by, br = augment_batch_gpu(train_x_all[bidx], train_y_all[bidx], train_r_all[bidx])
+                bx, by, bv, br, r_ok = augment_batch_gpu(
+                    train_x_all[bidx].float(), train_y_all[bidx],
+                    train_v_all[bidx], train_r_all[bidx], bev_lut=bev_lut)
 
                 opt.zero_grad(set_to_none=True)
                 seg_out, reg_out = model(bx)
-                loss = multitask_loss(seg_out, reg_out, by, br)
+                loss = multitask_loss(seg_out, reg_out, by, br, valid_mask=bv, reg_valid=r_ok)
                 loss.backward()
                 opt.step()
                 losses.append(float(loss.item()))

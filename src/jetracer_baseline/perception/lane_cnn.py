@@ -328,6 +328,8 @@ class CnnLaneDetector(object):
         self.last_used_fallback = False
         self.last_road_turn = 0
         self.last_road_entry_turn = 0
+        self.last_edge_guard = 0.0
+        self._ego_on_center = False
         self.road_guided = False
         self.last_bev = None         # cung mask do sau khi warp sang BEV
         self.n_disagree = 0
@@ -357,7 +359,14 @@ class CnnLaneDetector(object):
         self.reg_disagree = float(c('lane.cnn.reg_disagree', 0.35))
         self.check_reg = bool(c('lane.cnn.check_reg', True))
         self.entry_nudge_enabled = float(c('control.road_entry_steer', 0.0)) > 0.0
-        self.single_line_offset_px = float(c('lane.cnn.single_line_offset_px', 108.0))
+        # Nua be rong mat duong den do thuc te trong BEV 320x240 la ~70-78 px
+        # (mac dinh cu 108.0 day duong tam lech sau vao trong cua +34 px!).
+        self.single_line_offset_px = float(c('lane.cnn.single_line_offset_px', 74.0))
+        # Khoang cach an toan toi thieu tu duong tam Ch2 toi mep vach trang (BEV px).
+        self.center_edge_margin_px = float(c('lane.cnn.center_edge_margin_px', 32.0))
+        # Dem an toan chong cham vach trang o vung gan dau xe (BEV px & he so day).
+        self.edge_guard_px = float(c('lane.cnn.edge_guard_px', 42.0))
+        self.edge_guard_gain = float(c('lane.cnn.edge_guard_gain', 0.45))
 
     def _reset_state(self):
         self._cte = 0.0
@@ -606,10 +615,28 @@ class CnnLaneDetector(object):
         near = road_ids[-30:, half - 12:half + 12]
         road_counts = np.bincount(near.ravel())
         road_counts[0] = 0
-        if road_counts.max() < 40:
-            return None
-        ego_road = (road_ids == road_counts.argmax()).astype(np.uint8)
-        # Lap lo trong road truoc khi tim mep de loai vet trang do phan chieu.
+        if road_counts.max() >= 40:
+            self._ego_on_center = True
+            best_id = int(road_counts.argmax())
+        else:
+            # Xe da lech sat/de len vach trang: mo rong tim mat duong den o dai
+            # day anh de van biet phia nao la duong va keo xe quay lai.
+            self._ego_on_center = False
+            wide = road_ids[-48:, :]
+            w_counts = np.bincount(wide.ravel())
+            w_counts[0] = 0
+            if w_counts.max() < 120:
+                return None
+            best_id, best_dist = None, 1e9
+            for cid in np.flatnonzero(w_counts >= 120):
+                xs = np.where(wide == cid)[1]
+                d = abs(float(xs.mean()) - half)
+                if d < best_dist:
+                    best_id, best_dist = int(cid), d
+            if best_id is None:
+                return None
+        ego_road = (road_ids == best_id).astype(np.uint8)
+        # Lap lo trong road truoc khi tim mep de loai vet trang do phan chieu / vach START.
         outlines = cv2.findContours(ego_road, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
         cv2.drawContours(ego_road, outlines, -1, 1, cv2.FILLED)
         return ego_road
@@ -674,7 +701,7 @@ class CnnLaneDetector(object):
                 ts.append(t)
                 xs.append(float(np.median((left[indices] + right[indices]) * 0.5)))
                 npix += int(len(indices))
-        if len(ts) < max(3, self.min_bands) or ts[0] > 0.35:
+        if len(ts) < max(3, self.min_bands) or ts[0] > 0.45:
             return None
         co = self._fit_poly_fast(np.asarray(ts), np.asarray(xs))
         bev = None
@@ -749,6 +776,86 @@ class CnnLaneDetector(object):
         clear = np.all((ego_road[rows, cols] > 0) & self._bev_visible[rows, cols])
         return direction if clear else 0
 
+    def _point_near_outside(self, ego_road, outside, x, y, margin_px):
+        if x < 0 or x >= PROC_W or y < 0 or y >= PROC_H:
+            return True
+        if not ego_road[y, x]:
+            return True
+        r = int(round(margin_px))
+        if r <= 0 or outside is None:
+            return False
+        y0, y1 = max(0, y - r), min(PROC_H, y + r + 1)
+        x0, x1 = max(0, x - r), min(PROC_W, x + r + 1)
+        patch = outside[y0:y1, x0:x1]
+        if not patch.any():
+            return False
+        py, px = np.nonzero(patch)
+        dy = (py + y0) - y
+        dx = (px + x0) - x
+        return bool(np.min(dx * dx + dy * dy) < r * r)
+
+    def _center_edge_unsafe(self, ego_road, outside, co, t_max):
+        """True neu duong tam Ch2 chay ra ngoai mat duong hoac ap sat vach trang."""
+        if ego_road is None or co is None:
+            return False
+        t_look = min(self.lookahead, t_max)
+        x_look = int(round(float(np.polyval(co, t_look))))
+        y_look = int(np.clip(round((1.0 - t_look) * PROC_H), 0, PROC_H - 1))
+        if self._point_near_outside(ego_road, outside, x_look, y_look, self.center_edge_margin_px):
+            return True
+        t_near = min(0.25, t_max)
+        x_near = int(round(float(np.polyval(co, t_near))))
+        y_near = int(np.clip(round((1.0 - t_near) * PROC_H), 0, PROC_H - 1))
+        return not (0 <= x_near < PROC_W and ego_road[y_near, x_near])
+
+    def _apply_edge_guard(self, ego_road, outside, raw):
+        """Dem ao day xe khoi vach trang khi dau xe ap sat bien mat duong den."""
+        self.last_edge_guard = 0.0
+        if (ego_road is None or raw is None or
+                self.edge_guard_px <= 0.0 or self.edge_guard_gain <= 0.0):
+            return raw
+        half = PROC_W // 2
+        near_road = ego_road[168:224, :]
+        # Truong hop khan: mui xe da cham/vuot ra ngoai mat duong den -> keo manh ve phia mat duong
+        center_fill = float(np.count_nonzero(near_road[:, half - 8:half + 8])) / float(56 * 16)
+        if center_fill < 0.25:
+            xs_road = np.where(near_road > 0)[1]
+            if len(xs_road) < 80:
+                return raw
+            direction = 1.0 if float(np.median(xs_road)) >= half else -1.0
+            push = direction * self.edge_guard_gain
+            self.last_edge_guard = push
+            new_cte = float(np.clip(raw[0] + push, -1.0, 1.0))
+            new_look = raw[1]
+            if new_look * direction < 0.25:
+                new_look = float(np.clip(new_look + 0.6 * push, -1.0, 1.0))
+            return (new_cte, new_look, raw[2])
+
+        if outside is None:
+            return raw
+        out_near = outside[168:224, :]
+        left_out = out_near[:, :half]
+        right_out = out_near[:, half:]
+        has_l = left_out.any(axis=1)
+        has_r = right_out.any(axis=1)
+        d_left = float(np.median(left_out[has_l, ::-1].argmax(axis=1) + 1)) if has_l.any() else 999.0
+        d_right = float(np.median(right_out[has_r].argmax(axis=1) + 1)) if has_r.any() else 999.0
+
+        push = 0.0
+        if d_right < self.edge_guard_px and (d_right + 10.0) < d_left:
+            push = -self.edge_guard_gain * (self.edge_guard_px - d_right) / self.edge_guard_px
+        elif d_left < self.edge_guard_px and (d_left + 10.0) < d_right:
+            push = self.edge_guard_gain * (self.edge_guard_px - d_left) / self.edge_guard_px
+        if push == 0.0:
+            return raw
+
+        self.last_edge_guard = float(push)
+        new_cte = float(np.clip(raw[0] + push, -1.0, 1.0))
+        new_look = raw[1]
+        if raw[1] * push <= 0.0 or abs(raw[1]) < abs(push):
+            new_look = float(np.clip(raw[1] + 0.5 * push, -1.0, 1.0))
+        return (new_cte, new_look, raw[2])
+
     def _cte_disagrees(self, raw, reg):
         return (raw is not None and self.check_reg and reg is not None and len(reg) >= 1
                 and abs(float(reg[0]) - raw[0]) > self.reg_disagree)
@@ -756,6 +863,7 @@ class CnnLaneDetector(object):
     def _process_road_guided(self, seg3, reg, preview, t0):
         road_logits, center_logits = seg3[0], seg3[2]
         self.last_road_mask = self.last_mask = self.last_bev = None
+        self.last_edge_guard = 0.0
         co, t_max, n_bands, npix = self._mask_to_fit_lut(center_logits)
         raw = self._fit_values(co, t_max) if co is not None else None
         if self._cte_disagrees(raw, reg):
@@ -763,9 +871,10 @@ class CnnLaneDetector(object):
             raw = None
 
         ego_road = self._ego_road_bev(road_logits)
-        # Vung Ch0 da cham gan xe va phai keo dai den dai thu ba phia truoc.
+        outside = (self._bev_visible & (ego_road == 0)) if ego_road is not None else None
+        # Vung Ch0 phai nam ngay duoi mui xe va keo dai den dai thu ba phia truoc.
         band_h = PROC_H // N_BANDS
-        road_seen = (ego_road is not None and
+        road_seen = (ego_road is not None and self._ego_on_center and
                      np.count_nonzero(ego_road[-3 * band_h:-2 * band_h]) >= 10 * band_h)
         self._road_start_streak = self._road_start_streak + 1 if road_seen else 0
 
@@ -774,13 +883,20 @@ class CnnLaneDetector(object):
         wrong_way = (self.last_road_turn and raw is not None and
                      raw[1] * self.last_road_turn <= 0.0 and
                      abs(raw[1] - guide_raw[1]) >= 0.25)
-        if wrong_way or (raw is None and (self.last_road_turn or two_edges)):
-            co, _, n_bands, npix, self.last_bev = guide
-            # Khong de feed-forward quay nguoc huong mep xanh da xac nhan.
-            curv = 0.0 if guide_raw[2] * self.last_road_turn < 0.0 else guide_raw[2]
-            raw = (guide_raw[0], guide_raw[1], curv)
-            self.last_used_fallback = True
-            self.n_fallback += 1
+        edge_unsafe = (raw is not None and guide_raw is not None and
+                       self._center_edge_unsafe(ego_road, outside, co, t_max))
+        two_edge_drift = (two_edges and raw is not None and guide_raw is not None and
+                          (abs(raw[0] - guide_raw[0]) > 0.28 or abs(raw[1] - guide_raw[1]) > 0.30))
+        if wrong_way or edge_unsafe or two_edge_drift or (raw is None and (self.last_road_turn or two_edges or guide_raw is not None)):
+            if guide is not None and guide_raw is not None:
+                co, _, n_bands, npix, self.last_bev = guide
+                # Khong de feed-forward quay nguoc huong mep xanh da xac nhan.
+                curv = 0.0 if guide_raw[2] * self.last_road_turn < 0.0 else guide_raw[2]
+                raw = (guide_raw[0], guide_raw[1], curv)
+                self.last_used_fallback = True
+                self.n_fallback += 1
+
+        raw = self._apply_edge_guard(ego_road, outside, raw)
 
         if (self.entry_nudge_enabled and not self.last_road_turn and not self.last_used_fallback
                 and guide_raw is not None and raw is not None and n_bands >= 4

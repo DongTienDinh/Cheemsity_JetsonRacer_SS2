@@ -44,7 +44,7 @@ BEV_DST = np.float32([
 ])
 H_MAT = cv2.getPerspectiveTransform(BEV_SRC, BEV_DST)
 H_INV = cv2.getPerspectiveTransform(BEV_DST, BEV_SRC)
-DEFAULT_HALF_W_BEV = 48.0
+DEFAULT_HALF_W_BEV = 55.0
 CENTERLINE_THICKNESS_PX = 14
 
 

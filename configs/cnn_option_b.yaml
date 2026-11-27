@@ -40,7 +40,11 @@ lane:
     lookahead: 0.60
     check_reg: true
     reg_disagree: 0.35
-    # Chi bam DUNG phan vang (Ch2 centerline) model du doan, KHONG tu suy fallback
+    # Khi Ch2 yeu/sat mep o cua gat, suy tam tu mep mat duong Ch0 (nua lan thuc ~74 px BEV 320x240)
+    single_line_offset_px: 74.0
+    center_edge_margin_px: 32.0
+    edge_guard_px: 42.0
+    edge_guard_gain: 0.45
 
 # Gain điều khiển CNN (kế thừa profile configs/cnn.yaml)
 control:

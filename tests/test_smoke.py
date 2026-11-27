@@ -3110,6 +3110,71 @@ def test_cnn_fast_path_copies_only_road_and_center_preview():
     assert abs(r_no['lane'].cte - r_yes['lane'].cte) < 1e-6
 
 
+def test_lane_cnn_edge_guard_and_off_road_recovery():
+    """Kiem tra: offset 74px, fallback khi Ch2 ap sat mep, va dem chong cham vach trang."""
+    from jetracer_baseline.perception.lane_cnn import (
+        CnnLaneDetector, PROC_H, PROC_W, SEG_H, SEG_W)
+
+    for cfg_name in ('cnn_option_b.yaml', 'cnn_option_b_fast.yaml', 'cnn_option_b_fastscnn.yaml'):
+        c_opt = load_config(CONFIG, [os.path.join(ROOT, 'configs', cfg_name)])
+        assert abs(float(c_opt.get('lane.cnn.single_line_offset_px')) - 74.0) < 1e-6
+
+    cfg = load_config(CONFIG, [os.path.join(ROOT, 'configs', 'cnn_option_b.yaml')])
+    cfg.set('lane.cnn.engine', '')
+    cfg.set('lane.cnn.check_reg', False)
+    det = CnnLaneDetector(cfg)
+    det._M_seg = np.diag([PROC_W / float(SEG_W), PROC_H / float(SEG_H), 1.0])
+    det._build_bev_lut()
+    frame = np.zeros((PROC_H, PROC_W, 3), dtype=np.uint8)
+
+    class _Eng(object):
+        def infer(self, _x):
+            return {'seg': self.seg, 'reg': np.zeros(3, dtype=np.float32)}
+
+    det.engine = _Eng()
+
+    # 1. Xe o giua duong (mep xa 75 px hai ben) -> edge_guard = 0, khong fallback
+    seg = np.full((3, SEG_H, SEG_W), -5.0, dtype=np.float32)
+    seg[0, :, 34:94] = 5.0
+    seg[2, :, 62:66] = 5.0
+    det.engine.seg = seg
+    res_mid = det.process(frame)
+    assert res_mid.found and not det.last_used_fallback
+    assert abs(det.last_edge_guard) < 1e-6
+
+    # 2. Ch2 bi lech ap sat mep phai (cach mep ~10 px < 32 px) -> phai fallback ve tam Ch0
+    seg2 = np.full((3, SEG_H, SEG_W), -5.0, dtype=np.float32)
+    seg2[0, :, 34:94] = 5.0
+    seg2[2, :, 88:92] = 5.0
+    det.engine.seg = seg2
+    det.reset()
+    res_safe = det.process(frame)
+    assert res_safe.found and det.last_used_fallback
+    assert abs(res_safe.cte) < 0.12
+
+    # 3. Xe bi lech sat vach trang ben PHAI (road [16:74] -> mep phai o x=185, chi cach tam 160 dung 25px)
+    seg3 = np.full((3, SEG_H, SEG_W), -5.0, dtype=np.float32)
+    seg3[0, :, 16:74] = 5.0
+    seg3[2, :, 43:47] = 5.0
+    det.engine.seg = seg3
+    det.reset()
+    res_right = det.process(frame)
+    assert res_right.found
+    assert det.last_edge_guard < -0.10, 'phai day sang trai khoi vach phai, got %.3f' % det.last_edge_guard
+    assert res_right.cte < -0.25
+
+    # 4. Mui xe vuot sang mep trai (road chi con ben phai [72:120]) -> van tim ra duong
+    #    de keo lai sang phai, nhung road_start_ready PHAI la False.
+    seg4 = np.full((3, SEG_H, SEG_W), -5.0, dtype=np.float32)
+    seg4[0, :, 72:120] = 5.0
+    det.engine.seg = seg4
+    det.reset()
+    for _ in range(6):
+        res_rec = det.process(frame)
+    assert not det.road_start_ready
+    assert res_rec.found and det.last_edge_guard > 0.10 and res_rec.cte > 0.25
+
+
 if __name__ == '__main__':
     failures = 0
     for name, fn in sorted(list(globals().items())):

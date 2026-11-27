@@ -384,7 +384,8 @@ class Runner(object):
                     road_turn = 0
                 steer, throttle, drive_mode = self.corner.step(
                     pid_out, lane_res.cte, lane_res.curvature, dt,
-                    lane_found=lane_res.found, road_turn=road_turn)
+                    lane_found=lane_res.found, road_turn=road_turn,
+                    entry_turn=getattr(self.lane, 'last_road_entry_turn', 0))
 
                 if cmd.steer_override is not None:
                     steer = max(-self.steer_max,
