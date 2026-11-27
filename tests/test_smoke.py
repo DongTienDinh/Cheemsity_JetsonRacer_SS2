@@ -1141,7 +1141,7 @@ def test_disarm_cannot_be_followed_by_stale_driver_set():
     assert ui._armed is False and ui.mode == MODE_STOP
 
 
-def test_auto_control_rejects_command_from_pre_run_frame():
+def test_auto_control_checks_frame_age_and_entry_nudge_expiry():
     commands = []
 
     class Driver(object):
@@ -1171,6 +1171,15 @@ def test_auto_control_rejects_command_from_pre_run_frame():
 
     ui._control_loop()
     assert commands == [(0.0, 0.0)], commands
+
+    now = time.monotonic()
+    ui._run_started_mono = now - 1.0
+    ui._cv_started_mono = now - 0.12
+    ui._cv_steer = -0.08
+    ui._cv_entry_release = (now - 0.02, 0.31)
+    ui._control_stop.clear()
+    ui._control_loop()
+    assert commands[-1] == (0.31, 0.9), commands
 
 
 def test_auto_control_disarms_when_pipeline_command_is_stale():
@@ -1488,6 +1497,35 @@ def test_confirmed_road_turn_boosts_steering_without_increasing_limits():
     assert abs(left[0] + 0.48) < 1e-6
     assert abs(ctrl.step(-0.25, 0.0, 0.0, 1.0, road_turn=1)[0] + 0.40) < 1e-6
     assert ctrl.step(0.9, 0.0, 0.0, 1.0, road_turn=1)[0] == 0.60
+
+
+def test_road_entry_nudge_runs_once_and_yields_to_the_confirmed_turn():
+    ctrl = CornerController(_corner_cfg(control__road_entry_steer=0.08))
+    dt = 1.0 / 30.0
+    for direction in (-1, 1):
+        ctrl.reset()
+        for _ in range(10):
+            ctrl.step(0.0, 0.0, 0.0, dt)
+        for _ in range(3):
+            steer, throttle, _mode = ctrl.step(direction * 0.25, 0.0, 0.0, dt,
+                                               entry_turn=direction)
+            assert steer == -direction * 0.08 and throttle == 0.12
+            assert ctrl.entry_return_steer == direction * 0.25
+        for _ in range(5):
+            steer, _, _ = ctrl.step(direction * 0.25, 0.0, 0.0, dt, entry_turn=direction)
+            assert steer * direction > 0 and ctrl.entry_return_steer is None
+
+    for _ in range(10):
+        ctrl.step(0.0, 0.0, 0.0, dt)
+    assert ctrl.step(0.25, 0.0, 0.0, dt, entry_turn=1)[0] == -0.08
+    assert ctrl.step(0.25, 0.0, 0.0, dt, road_turn=1)[0] > 0.0
+    assert ctrl.entry_return_steer is None
+
+    ctrl.reset()
+    for _ in range(10):
+        ctrl.step(0.0, 0.0, 0.0, dt)
+    assert ctrl.step(0.25, 0.0, 0.0, 0.09, entry_turn=1)[0] == 0.25
+    assert ctrl.step(0.25, 0.0, 0.0, dt, entry_turn=1)[0] == 0.25
 
 
 def test_confirmed_turn_releases_steering_gradually_and_cancels_on_direction_change():

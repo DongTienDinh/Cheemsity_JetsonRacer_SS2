@@ -30,6 +30,7 @@ khi thay cua; len ga thi tu tu de banh khong truot.
 
 STRAIGHT = 'THANG'
 CORNER = 'CUA'
+ENTRY_NUDGE_SECONDS = 0.10
 
 
 class CornerController(object):
@@ -74,6 +75,7 @@ class CornerController(object):
         self.corner_steer_gain = float(c('control.corner_steer_gain', 1.6))
         self.road_turn_steer_gain = float(c('control.road_turn_steer_gain', 1.0))
         self.road_turn_release_s = max(0.0, float(c('control.road_turn_release_s', 0.0)))
+        self.road_entry_steer = max(0.0, min(0.15, float(c('control.road_entry_steer', 0.0))))
         self.steer_max = float(c('control.steer_max', 0.60))
         # Tran lai RIENG cho khuc cua. Cua cua sa ban rat hep nen can be gan het
         # lai, nhung dung tran do cho ca doan thang thi xe giat va de vuot lane.
@@ -95,6 +97,11 @@ class CornerController(object):
         self._hold = 0.0
         self._exit_steer = 0.0
         self._exit_elapsed = 0.0
+        self._entry_seen = False
+        self._entry_remaining = 0.0
+        self._entry_direction = 0
+        self._entry_straight = 0.0
+        self.entry_return_steer = None
 
     # ------------------------------------------------------------------ mode
     def update_mode(self, curvature):
@@ -130,8 +137,36 @@ class CornerController(object):
             steer += (self._exit_steer - steer) * remaining
         return steer
 
+    def _road_entry_command(self, steer, cte, road_turn, entry_turn, lane_found, dt):
+        self.entry_return_steer = None
+        if not (lane_found and (road_turn or entry_turn)):
+            self._entry_remaining = 0.0
+            if lane_found and self.mode == STRAIGHT:
+                self._entry_straight = min(0.30, self._entry_straight + dt)
+                if self._entry_straight >= 0.30:
+                    self._entry_seen = False
+            else:
+                self._entry_straight = 0.0
+            return steer
+
+        first_hint = not self._entry_seen
+        self._entry_seen = True
+        if first_hint and self._entry_straight >= 0.30 and abs(self.steer_wanted) <= 0.35:
+            self._entry_direction = entry_turn
+            self._entry_remaining = ENTRY_NUDGE_SECONDS
+        self._entry_straight = 0.0
+
+        if (road_turn or not entry_turn or entry_turn != self._entry_direction or
+                self.road_entry_steer <= 0.0 or abs(cte) > 0.12 or steer * entry_turn <= 0.0 or
+                dt > 0.05 or self._entry_remaining + 1e-6 < dt):
+            self._entry_remaining = 0.0
+            return steer
+        self._entry_remaining = max(0.0, self._entry_remaining - dt)
+        self.entry_return_steer = steer
+        return -entry_turn * self.road_entry_steer
+
     # ------------------------------------------------------------------- step
-    def step(self, pid_output, cte, curvature, dt, lane_found=True, road_turn=0):
+    def step(self, pid_output, cte, curvature, dt, lane_found=True, road_turn=0, entry_turn=0):
         """Tra ve (steer, throttle, mode).
 
         `pid_output` la dau ra PID da tinh san - CornerController khong so huu
@@ -154,6 +189,9 @@ class CornerController(object):
             if steer * road_turn > 0.0:
                 steer *= self.road_turn_steer_gain
             limit = self.corner_steer_max
+        steer = self._road_entry_command(steer, cte, road_turn, entry_turn, lane_found, dt)
+        if self.entry_return_steer is not None:
+            self.entry_return_steer = max(-limit, min(limit, self.entry_return_steer))
         steer = self._steer_at_road_exit(steer, limit, road_turn, lane_found, dt)
         self.steer_wanted = steer          # truoc khi cat, de bao chan tran
         steer = max(-limit, min(limit, steer))
@@ -166,7 +204,7 @@ class CornerController(object):
             self._hold = max(0.0, self._hold - dt)
         # `_hold > 0` = vua ra khoi cua chua lau -> van giu ga cua. Xem docstring
         # cua `corner_hold_s`: day la thu giu hai thuy chu S lien lai voi nhau.
-        in_corner_speed = (mode == CORNER) or (self._hold > 0.0)
+        in_corner_speed = (mode == CORNER) or (self._hold > 0.0) or (lane_found and entry_turn)
         target = self.v_corner if in_corner_speed else self.v_straight
         target -= self.curve_brake * abs(float(curvature))   # don dau
         target -= self.slowdown * abs(float(cte))            # phan ung

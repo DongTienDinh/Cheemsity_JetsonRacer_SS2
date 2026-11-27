@@ -327,6 +327,7 @@ class CnnLaneDetector(object):
         self.last_road_mask = None   # Option B Ch0 (64x128) neu model 3 kenh
         self.last_used_fallback = False
         self.last_road_turn = 0
+        self.last_road_entry_turn = 0
         self.road_guided = False
         self.last_bev = None         # cung mask do sau khi warp sang BEV
         self.n_disagree = 0
@@ -355,6 +356,7 @@ class CnnLaneDetector(object):
         # bao found=False de FSM ha ga / roi ve CV.
         self.reg_disagree = float(c('lane.cnn.reg_disagree', 0.35))
         self.check_reg = bool(c('lane.cnn.check_reg', True))
+        self.entry_nudge_enabled = float(c('control.road_entry_steer', 0.0)) > 0.0
         self.single_line_offset_px = float(c('lane.cnn.single_line_offset_px', 108.0))
 
     def _reset_state(self):
@@ -724,6 +726,29 @@ class CnnLaneDetector(object):
             return 0
         return 1 if lateral > 0.0 else -1
 
+    def _road_entry_direction(self, ego_road, guide, center, t_max):
+        """Bao cua som khi hai duong con thay du phia xa va mep ngoai con cho."""
+        road_curve, road_end = guide[:2]
+        far = min(0.85, t_max, road_end)
+        near = 0.30
+        if far < 0.65:
+            return 0
+        half = PROC_W // 2
+        shift = (np.polyval(road_curve, far) - np.polyval(road_curve, near)) / half
+        direction = 1 if shift > 0 else -1
+        yellow_shift = (np.polyval(center, far) - np.polyval(center, near)) / half
+        bend = road_curve[0] * (far - near) ** 2 / half
+        near_cte = (np.polyval(center, 0.15) - half) / half
+        if (abs(shift) < 0.12 or yellow_shift * direction < 0.06 or
+                bend * direction < 0.02 or abs(near_cte) > 0.16):
+            return 0
+
+        band_h = PROC_H // N_BANDS
+        rows = slice(-2 * band_h, -band_h)
+        cols = slice(half - 36, half - 10) if direction > 0 else slice(half + 10, half + 36)
+        clear = np.all((ego_road[rows, cols] > 0) & self._bev_visible[rows, cols])
+        return direction if clear else 0
+
     def _cte_disagrees(self, raw, reg):
         return (raw is not None and self.check_reg and reg is not None and len(reg) >= 1
                 and abs(float(reg[0]) - raw[0]) > self.reg_disagree)
@@ -757,6 +782,11 @@ class CnnLaneDetector(object):
             self.last_used_fallback = True
             self.n_fallback += 1
 
+        if (self.entry_nudge_enabled and not self.last_road_turn and not self.last_used_fallback
+                and guide_raw is not None and raw is not None and n_bands >= 4
+                and abs(raw[1]) <= 0.45 and abs(raw[2]) <= 0.36):
+            self.last_road_entry_turn = self._road_entry_direction(ego_road, guide, co, t_max)
+
         if preview:
             self.last_road_mask = (road_logits > 0.0).astype(np.uint8) * 255
             if self.last_used_fallback:
@@ -788,6 +818,7 @@ class CnnLaneDetector(object):
         seg, reg = self._pick_outputs(outs)
         self.last_used_fallback = False
         self.last_road_turn = 0
+        self.last_road_entry_turn = 0
         self.road_guided = seg.size == 3 * SEG_H * SEG_W
         if self.road_guided:
             return self._process_road_guided(seg.reshape(3, SEG_H, SEG_W), reg, compute_bev, t0)

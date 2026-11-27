@@ -34,7 +34,7 @@ import yaml
 from .camera import (LatestFrameGrabber, build_source,
                      format_camera_environment, shading_applied_at_source)
 from .config import load_config
-from .control.corner import CornerController
+from .control.corner import CornerController, ENTRY_NUDGE_SECONDS
 from .control.driver import servo_output_for
 from .control.driver import build_driver
 from .control.pid import PID
@@ -96,6 +96,7 @@ CONTROL_PARAMS = [
     ('control.corner_steer_gain', 'Boi lai khi cua', 1.0, 3.0, 0.05),
     ('control.road_turn_steer_gain', 'Lai cua gat', 1.0, 1.50, 0.05),
     ('control.road_turn_release_s', 'Nha lai ra cua (s)', 0.0, 0.60, 0.05),
+    ('control.road_entry_steer', 'Mo cua ra ngoai', 0.0, 0.15, 0.01),
     ('control.steer_max', 'Lai toi da (thang)', 0.10, 1.00, 0.05),
     ('control.corner_steer_max', 'Lai toi da (CUA)', 0.10, 1.00, 0.05),
     ('control.pid.kp', 'PID Kp', 0.0, 2.0, 0.05),
@@ -458,7 +459,7 @@ class LaneTuningEngine(object):
             pid_out = self.pid.step(err, dt)
             steer, throttle, mode = self.corner.step(
                 pid_out, res.cte, res.curvature, dt, lane_found=res.found,
-                road_turn=road_turn)
+                road_turn=road_turn, entry_turn=getattr(self.lane, 'last_road_entry_turn', 0))
             ramp = self.soft_start_scale(now)
             throttle *= ramp
 
@@ -489,6 +490,7 @@ class LaneTuningEngine(object):
             result['waiting_for_path'] = self._waiting_for_path
             result['road_turn'] = self.lane.last_road_turn
             result['used_fallback'] = self.lane.last_used_fallback
+            result['entry_return_steer'] = self.corner.entry_return_steer
         if copy_preview:
             lane_mask = getattr(self.lane, 'last_mask', None)
             if lane_mask is not None:
@@ -862,6 +864,7 @@ class LaneTuningUI(object):
         self._state_lock = threading.Lock()
         self._cv_steer = 0.0
         self._cv_throttle = 0.0
+        self._cv_entry_release = None
         self._cv_started_mono = None
         self._cv_updated_mono = None
         self._camera_stop_reason = None
@@ -1212,6 +1215,14 @@ class LaneTuningUI(object):
             with self._state_lock:
                 self._cv_steer = result['steer']
                 self._cv_throttle = result['throttle']
+                entry_return = result.get('entry_return_steer')
+                if entry_return is None:
+                    self._cv_entry_release = None
+                else:
+                    # Het han theo dong ho cua luong driver, ke ca khi camera cham frame.
+                    previous = getattr(self, '_cv_entry_release', None)
+                    deadline = previous[0] if previous is not None else pipeline_t0 + ENTRY_NUDGE_SECONDS
+                    self._cv_entry_release = (deadline, entry_return)
                 self._cv_started_mono = pipeline_t0
                 self._cv_updated_mono = completed
 
@@ -1644,6 +1655,9 @@ class LaneTuningUI(object):
                         throttle = self._cv_throttle
                         cv_started_mono = self._cv_started_mono
                         cv_updated_mono = getattr(self, '_cv_updated_mono', None)
+                        entry_release = getattr(self, '_cv_entry_release', None)
+                        if entry_release is not None and t0 >= entry_release[0]:
+                            steer = entry_release[1]
                     # Lenh sinh tu frame bat dau truoc moc CHAY la lenh cu.
                     # Gui neutral (0, 0) den khi co completion dau tien cua luot moi.
                     stall_detail = None
@@ -2112,6 +2126,7 @@ class LaneTuningUI(object):
             with self._state_lock:
                 self._cv_started_mono = None
                 self._cv_updated_mono = None
+                self._cv_entry_release = None
             self._ensure_preview_thread()
             self._thread = threading.Thread(target=self._loop, args=(grabber,))
             self._thread.daemon = True
@@ -2186,6 +2201,7 @@ class LaneTuningUI(object):
             with self._state_lock:
                 self._cv_steer = 0.0
                 self._cv_throttle = 0.0
+                self._cv_entry_release = None
                 self._cv_started_mono = None
                 self._cv_updated_mono = None
             if not self._start_run_log(MODE_AUTO):
@@ -2340,6 +2356,9 @@ class LaneTuningUI(object):
         nha_lai = w.FloatSlider(
             value=float(g('control.road_turn_release_s', 0.0)),
             min=0.0, max=0.60, step=0.05, description='NHA LAI RA CUA (s)', **L)
+        mo_cua = w.FloatSlider(
+            value=float(g('control.road_entry_steer', 0.0)),
+            min=0.0, max=0.15, step=0.01, description='MO CUA RA NGOAI', **L)
         phanh = w.FloatSlider(
             value=self._cfg_to_phanh(g('control.curve_brake', 0.30)),
             min=0.0, max=1.0, step=0.05,
@@ -2350,7 +2369,7 @@ class LaneTuningUI(object):
             description='GOC LAI TOI DA', **L)
         # Moi num mot dong so RIENG ngay duoi. Doc dam, luon hien du cot hep.
         notes = dict((k, w.HTML()) for k in
-                     ('toc_do', 'toc_cua', 'cua_som', 'lai_cua_gat', 'nha_lai', 'phanh', 'goc_lai'))
+                     ('toc_do', 'toc_cua', 'cua_som', 'lai_cua_gat', 'nha_lai', 'mo_cua', 'phanh', 'goc_lai'))
         info = w.HTML()
 
         def _n(html):
@@ -2383,6 +2402,7 @@ class LaneTuningUI(object):
                 'nhan lai <b>%.2fx</b> khi mep xanh va diem ngam cung huong'
                 % gp('control.road_turn_steer_gain', 1.0))
             notes['nha_lai'].value = _n('thoi gian nha lai dan sau cua gat')
+            notes['mo_cua'].value = _n('nhich ra ngoai toi da 0.10 s khi doc duoc cua tu xa va con cho')
             notes['phanh'].value = _n(
                 'phanh theo do cong <b>%.2f</b> &nbsp;|&nbsp; theo do lech '
                 '<b>%.2f</b>' % (gp('control.curve_brake', 0),
@@ -2439,6 +2459,8 @@ class LaneTuningUI(object):
             'control.road_turn_steer_gain', v), update_speed_cap=False), names='value')
         nha_lai.observe(mk(lambda v: self.engine.set_param(
             'control.road_turn_release_s', v), update_speed_cap=False), names='value')
+        mo_cua.observe(mk(lambda v: self.engine.set_param(
+            'control.road_entry_steer', v), update_speed_cap=False), names='value')
         _refresh()
 
         huong_dan = w.HTML(
@@ -2463,6 +2485,7 @@ class LaneTuningUI(object):
                        cua_som, notes['cua_som'],
                        lai_cua_gat, notes['lai_cua_gat'],
                        nha_lai, notes['nha_lai'],
+                       mo_cua, notes['mo_cua'],
                        phanh, notes['phanh'],
                        goc_lai, notes['goc_lai'],
                        info, huong_dan])
