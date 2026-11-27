@@ -15,6 +15,17 @@
 #        python3 -m src.jetracer_baseline.cli run --task speed --driver nvidia \
 #            --override configs/cnn_option_b_fastscnn.yaml --record
 
+# Tối ưu CPU Jetson Nano (nvvidconv xuất 320x240 trực tiếp, shading 320x240, hạ preview khi chạy)
+camera:
+  width: 320
+  height: 240
+  shading:
+    apply_at: pipeline
+
+tuning:
+  preview_hz: 5
+  run_preview_hz: 1.0
+
 lane:
   mode: cnn
   cnn:

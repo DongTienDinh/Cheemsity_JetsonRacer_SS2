@@ -654,7 +654,30 @@ def export_onnx(model, out_path):
         torch.onnx.export(model_cpu, dummy, out_path, **kwargs)
     import onnx
     om = onnx.load(out_path)
+    # Loai bo node Identity thua va ep ir_version <= 6 de tuong thich tuyet doi TensorRT 7.1.3
+    id_map = {}
+    new_nodes = []
+    for n in om.graph.node:
+        if n.op_type == 'Identity':
+            src = n.input[0]
+            while src in id_map:
+                src = id_map[src]
+            id_map[n.output[0]] = src
+        else:
+            for i, inp in enumerate(n.input):
+                if inp in id_map:
+                    n.input[i] = id_map[inp]
+            new_nodes.append(n)
+    if id_map:
+        del om.graph.node[:]
+        om.graph.node.extend(new_nodes)
+        for out in om.graph.output:
+            if out.name in id_map:
+                out.name = id_map[out.name]
+    if om.ir_version > 6:
+        om.ir_version = 6
     onnx.checker.check_model(om)
+    onnx.save(om, out_path)
     return os.path.getsize(out_path) / 1024.0
 
 

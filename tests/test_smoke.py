@@ -1891,6 +1891,7 @@ def test_lane_cnn_supports_option_b_3channel_and_road_fallback():
     from jetracer_baseline.perception.lane_cnn import CnnLaneDetector, SEG_H, SEG_W
 
     for cfg_name, exp_engine in (
+        ('cnn_option_b_fast.yaml', 'models/lane_option_b_fast.engine'),
         ('cnn_option_b.yaml', 'models/lane_option_b_resse.engine'),
         ('cnn_option_b_fastscnn.yaml', 'models/lane_option_b_fastscnn.engine'),
     ):
@@ -1898,6 +1899,10 @@ def test_lane_cnn_supports_option_b_3channel_and_road_fallback():
         assert cfg_opt.get('lane.mode') == 'cnn'
         assert abs(float(cfg_opt.get('lane.cnn.roi_top')) - 0.34) < 1e-6
         assert cfg_opt.get('lane.cnn.engine') == exp_engine
+        assert int(cfg_opt.get('camera.width')) == 320
+        assert int(cfg_opt.get('camera.height')) == 240
+        assert cfg_opt.get('camera.shading.apply_at') == 'pipeline'
+        assert float(cfg_opt.get('tuning.run_preview_hz')) == 1.0
 
     class FakeEngine(object):
         def __init__(self):
@@ -2862,6 +2867,53 @@ def test_csi_source_release_nulls_cap_before_releasing():
         if source is not None:
             source.release()
         camera_mod.cv2.VideoCapture = original
+
+
+def test_cnn_fast_path_vectorized_two_lines_and_lazy_preview_copy():
+    """Vectorized _check_two_lines khop truong hop bien & copy_preview=False bo qua copy mask."""
+    from jetracer_baseline.perception.lane_cnn import CnnLaneDetector, SEG_H, SEG_W
+
+    # 1. Kiem tra cac truong hop bien cua _check_two_lines
+    empty = np.zeros((SEG_H, SEG_W), dtype=np.uint8)
+    assert CnnLaneDetector._check_two_lines(empty, empty, empty) == (False, False, False)
+
+    left_only = np.zeros((SEG_H, SEG_W), dtype=np.uint8)
+    left_only[20:40, 18:22] = 255
+    center = np.zeros((SEG_H, SEG_W), dtype=np.uint8)
+    center[20:40, 62:66] = 255
+    assert CnnLaneDetector._check_two_lines(left_only, center, None) == (True, False, False)
+
+    both = left_only.copy()
+    both[20:40, 102:106] = 255
+    assert CnnLaneDetector._check_two_lines(both, center, None) == (True, True, True)
+    assert CnnLaneDetector._check_two_lines(both, None, None) == (True, True, True)
+
+    # 2. LaneTuningEngine.process(..., copy_preview=False) khong copy 4 mask preview
+    cfg = load_config(CONFIG, [os.path.join(ROOT, 'configs', 'cnn_option_b_fast.yaml')])
+    cfg.set('lane.cnn.engine', '')
+    cfg.set('lane.cnn.check_reg', False)
+    engine = LaneTuningEngine(CONFIG)
+    engine.cfg = cfg
+    det = CnnLaneDetector(cfg)
+
+    class _FakeEng(object):
+        def infer(self, _x):
+            s = np.full((1, 3, SEG_H, SEG_W), -5.0, dtype=np.float32)
+            s[0, 0, 10:64, 34:94] = 5.0
+            s[0, 1, 10:64, 34:38] = 5.0
+            s[0, 1, 10:64, 90:94] = 5.0
+            s[0, 2, 10:64, 62:66] = 5.0
+            return {'seg': s, 'reg': np.zeros((1, 3), dtype=np.float32)}
+
+    det.engine = _FakeEng()
+    engine.lane = det
+    engine._dirty = False
+    frame = np.full((240, 320, 3), 40, dtype=np.uint8)
+    r_no = engine.process(frame, 1.0 / 30.0, copy_preview=False)
+    assert r_no['lane'].found and r_no.get('two_lines_ok') is True
+    assert '_preview_mask' not in r_no and '_preview_white' not in r_no
+    r_yes = engine.process(frame, 1.0 / 30.0, copy_preview=True)
+    assert r_yes.get('_preview_mask') is not None and r_yes.get('_preview_white') is not None
 
 
 if __name__ == '__main__':

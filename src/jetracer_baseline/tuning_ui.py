@@ -437,7 +437,7 @@ class LaneTuningEngine(object):
         return max(0.0, elapsed / self.soft_start_s)
 
     # ----------------------------------------------------------------- process
-    def process(self, frame_bgr, dt, now=None):
+    def process(self, frame_bgr, dt, now=None, copy_preview=True):
         """Tra ve dict ket qua. KHONG gui lenh ra driver - do la viec cua UI."""
         if self._dirty:
             self.rebuild()
@@ -474,26 +474,27 @@ class LaneTuningEngine(object):
             'servo': servo, 'servo_span': self.drv_out_max,
             'steer_clipped': steer_clipped, 'servo_clipped': servo_clipped,
             'steer_wanted': self.corner.steer_wanted,
+            'infer_ms': float(getattr(self.lane, 'last_infer_ms', 0.0)),
+            'lane_total_ms': float(getattr(self.lane, 'last_total_ms', 0.0)),
         }
-        lane_mask = getattr(self.lane, 'last_mask', None)
-        if lane_mask is not None:
-            # Chi ~32 KiB voi mask CNN 256x128; doi lai preview khong can khoa
-            # TensorRT detector va khong the lay nham mask cua frame sau.
-            result['_preview_mask'] = lane_mask.copy()
-        road_mask = getattr(self.lane, 'last_road_mask', None)
-        white_mask = getattr(self.lane, 'last_white_mask', None)
-        center_mask = getattr(self.lane, 'last_center_mask', None)
-        if white_mask is not None:
-            # Option B 3 kenh (64x128 = 8 KiB/kenh) -> ve ro 2 line trang 2 ben + duong + tam
-            result['_preview_white'] = white_mask.copy()
-            if road_mask is not None:
-                result['_preview_road'] = road_mask.copy()
-            if center_mask is not None:
-                result['_preview_center'] = center_mask.copy()
+        if has_opt_b:
             result['left_line'] = bool(getattr(self.lane, 'last_left_line', False))
             result['right_line'] = bool(getattr(self.lane, 'last_right_line', False))
             result['two_lines_ok'] = bool(getattr(self.lane, 'last_two_lines_ok', False))
             result['used_fallback'] = bool(getattr(self.lane, 'last_used_fallback', False))
+        if copy_preview:
+            lane_mask = getattr(self.lane, 'last_mask', None)
+            if lane_mask is not None:
+                result['_preview_mask'] = lane_mask.copy()
+            road_mask = getattr(self.lane, 'last_road_mask', None)
+            white_mask = getattr(self.lane, 'last_white_mask', None)
+            center_mask = getattr(self.lane, 'last_center_mask', None)
+            if white_mask is not None:
+                result['_preview_white'] = white_mask.copy()
+                if road_mask is not None:
+                    result['_preview_road'] = road_mask.copy()
+                if center_mask is not None:
+                    result['_preview_center'] = center_mask.copy()
         return result
 
     # ------------------------------------------------------------------ render
@@ -801,10 +802,10 @@ class LaneTuningUI(object):
                 'Can ipywidgets trong moi truong Jupyter. Kiem tra bang: '
                 'python3 -c "import ipywidgets; print(ipywidgets.__version__)"')
 
-        # Giong manual_collection: uu tien do phan hoi cua vong dieu khien hon
-        # thong luong tong khi thread camera dang ma hoa JPEG.
+        # Giu switchinterval mac dinh 5ms (khong ep 1ms gay thrash GIL tren
+        # Jetson Nano 2-core 5W khi co 4-5 luong chay song song).
         import sys as _sys
-        _sys.setswitchinterval(0.001)
+        _sys.setswitchinterval(0.005)
 
         self.simple = bool(simple)
         self.widgets = widgets
@@ -878,8 +879,13 @@ class LaneTuningUI(object):
 
         # Render panel + encode JPEG la viec cua UI, khong thuoc pipeline dieu
         # khien. Worker chi giu payload moi nhat (khong xep hang frame cu).
+        # Khi xe DANG CHAY TU DONG, giam nhip preview ve `run_preview_hz` (mac
+        # dinh 1 Hz) de tranh tranh CPU/GIL gay spike 100-170ms tren Jetson Nano.
         preview_hz = float(self.engine.get_param('tuning.preview_hz', 5.0))
-        self._preview_period = 1.0 / max(1.0, preview_hz)
+        run_preview_hz = float(self.engine.get_param('tuning.run_preview_hz', 1.0))
+        self._preview_period = 1.0 / max(0.5, preview_hz)
+        self._run_preview_period = (
+            None if run_preview_hz <= 0.0 else 1.0 / max(0.2, run_preview_hz))
         self._preview_lock = threading.Lock()
         self._preview_event = threading.Event()
         self._preview_stop = threading.Event()
@@ -1170,9 +1176,18 @@ class LaneTuningUI(object):
             dt = (1.0 / 30.0) if t_prev is None else max(1e-6, now_mono - t_prev)
             t_prev = now_mono
 
+            preview_period = (
+                getattr(self, '_run_preview_period', self._preview_period)
+                if (self._armed and self.mode == MODE_AUTO)
+                else self._preview_period)
+            want_preview = (
+                preview_period is not None and
+                (now_mono - last_preview) >= preview_period)
+
             try:
                 with self._engine_lock:
-                    result = self.engine.process(frame, dt, now=now)
+                    result = self.engine.process(
+                        frame, dt, now=now, copy_preview=want_preview)
             except Exception as exc:
                 # Bao THAT TO. Truoc day chi ghi mot dong log duoi cung: vong
                 # lap break, panel dung im o khung hinh cuoi, va nguoi dung
@@ -1207,7 +1222,7 @@ class LaneTuningUI(object):
             self._record_dataset(frame, frame_id, result, now,
                                  completed)
 
-            if (completed - last_preview) >= self._preview_period:
+            if want_preview:
                 last_preview = completed
                 self._queue_preview(result)
 
@@ -1529,6 +1544,14 @@ class LaneTuningUI(object):
         if warn:
             banner = ('<div style="color:#b00020"><b>Canh bao:</b> %s</div>'
                       % '; '.join(warn))
+        cnn_row = ''
+        if getattr(self, 'dung_cnn', False):
+            inf_ms = float(getattr(self.engine.lane, 'last_infer_ms', 0.0))
+            tot_ms = float(getattr(self.engine.lane, 'last_total_ms', 0.0))
+            cnn_row = (
+                '<tr><td>CNN infer</td><td><b>%.1f ms</b></td>'
+                '<td style="padding-left:18px">CNN tong</td><td><b>%.1f ms</b></td></tr>'
+                % (inf_ms, tot_ms))
         return (
             '%s<table style="font-family:monospace">'
             '<tr><td>so mau</td><td><b>%d</b></td>'
@@ -1538,10 +1561,11 @@ class LaneTuningUI(object):
             '<tr><td>dai TB</td><td><b>%.1f</b></td>'
             '<td style="padding-left:18px">lai doi dau</td><td><b>%d</b></td></tr>'
             '<tr><td>FPS xu ly</td><td><b>%.1f</b></td>'
-            '<td style="padding-left:18px">muc tieu</td><td><b>&gt;=20</b></td></tr>'
+            '<td style="padding-left:18px">muc tieu</td><td><b>&gt;=25</b></td></tr>'
+            '%s'
             '</table>' % (banner, s['n'], s['loss_pct'], s['cte_rms'],
                           s['cte_p95'], s['bands_mean'], s['steer_flips'],
-                          self._fps))
+                          self._fps, cnn_row))
 
     # --------------------------------------------------- vong dieu khien 30 Hz
     def _controller_ready(self):

@@ -29,14 +29,20 @@ TRTEXEC_CANDIDATES = [
 ]
 
 MODELS = {
+    'fast': {
+        'label': 'Option B #1: LaneTiny-Fast (uu tien toc do >= 25 FPS, 56K params, 0 SE)',
+        'onnx': 'models/lane_option_b_fast.onnx',
+        'engine': 'models/lane_option_b_fast.engine',
+        'config': 'configs/cnn_option_b_fast.yaml',
+    },
     'resse': {
-        'label': 'Option B #1: LaneTiny-ResSE (uu tien chay chinh)',
+        'label': 'Option B #4: LaneTiny-ResSE (can bang, 157K params)',
         'onnx': 'models/lane_option_b_resse.onnx',
         'engine': 'models/lane_option_b_resse.engine',
         'config': 'configs/cnn_option_b.yaml',
     },
     'fastscnn': {
-        'label': 'Option B #2: FastSCNN-Lane (du phong / A-B test)',
+        'label': 'Option B #5: FastSCNN-Lane (du phong / A-B test, 331K params)',
         'onnx': 'models/lane_option_b_fastscnn.onnx',
         'engine': 'models/lane_option_b_fastscnn.engine',
         'config': 'configs/cnn_option_b_fastscnn.yaml',
@@ -126,23 +132,32 @@ def verify_engine(config_rel):
         [os.path.join(ROOT, config_rel)],
     )
     det = CnnLaneDetector(cfg)
-    dummy = np.zeros((480, 640, 3), dtype=np.uint8)
-    times = []
-    for _ in range(20):
-        det.process(dummy)
-        times.append(det.last_infer_ms)
-    p50 = float(np.percentile(np.array(times), 50))
-    p95 = float(np.percentile(np.array(times), 95))
-    has_3ch = det.last_white_mask is not None and det.last_road_mask is not None
-    print('  [ OK ] Nap TensorRT OK | 3 kenh Option B=%s | infer p50=%.2f ms, p95=%.2f ms'
-          % ('CO' if has_3ch else 'KHONG', p50, p95))
-    return has_3ch
+    try:
+        dummy = np.zeros((240, 320, 3), dtype=np.uint8)
+        inf_times = []
+        tot_times = []
+        for _ in range(30):
+            det.process(dummy)
+            inf_times.append(det.last_infer_ms)
+            tot_times.append(det.last_total_ms)
+        inf_p50 = float(np.percentile(np.array(inf_times), 50))
+        inf_p95 = float(np.percentile(np.array(inf_times), 95))
+        tot_p50 = float(np.percentile(np.array(tot_times), 50))
+        tot_p95 = float(np.percentile(np.array(tot_times), 95))
+        fps_p50 = 1000.0 / max(tot_p50, 1e-6)
+        has_3ch = det.last_white_mask is not None and det.last_road_mask is not None
+        print('  [ OK ] Nap TensorRT OK | 3 kenh=%s | infer p50=%.2fms p95=%.2fms | '
+              'tong p50=%.2fms p95=%.2fms (~%.1f FPS)'
+              % ('CO' if has_3ch else 'KHONG', inf_p50, inf_p95, tot_p50, tot_p95, fps_p50))
+        return has_3ch
+    finally:
+        det.close()
 
 
 def main():
     ap = argparse.ArgumentParser(
         description='Kiem tra Jetson Nano va build TensorRT FP16 engine cho Option B.')
-    ap.add_argument('--model', choices=['all', 'resse', 'fastscnn'],
+    ap.add_argument('--model', choices=['all', 'fast', 'resse', 'fastscnn'],
                     default='all', help='Chon model de build (mac dinh: all)')
     ap.add_argument('--workspace', type=int, default=256,
                     help='Bo nho workspace TensorRT (MB, mac dinh: 256)')
@@ -157,7 +172,7 @@ def main():
     print('\n=== BUOC 2: KIEM TRA TRTEXEC & FILE ONNX ===')
     print('trtexec:', trtexec if trtexec else 'KHONG TIM THAY (/usr/src/tensorrt/bin/trtexec)')
 
-    selected = ['resse', 'fastscnn'] if args.model == 'all' else [args.model]
+    selected = ['fast', 'resse', 'fastscnn'] if args.model == 'all' else [args.model]
     for key in selected:
         info = MODELS[key]
         onnx_path = os.path.join(ROOT, info['onnx'])
@@ -192,13 +207,14 @@ def main():
     print('\n=== HOAN TAT ===')
     if all_ok:
         print('San sang chay Speed Track! Cac buoc tiep theo:')
-        print('  1. Kiem tra dau CTE (day xe sang trai -> cte duong):')
-        print('       python3 tools/bench_lane_cnn.py --override configs/cnn_option_b.yaml --watch --source csi')
+        print('  1. Do latency & kiem tra dau CTE (day xe sang trai -> cte duong):')
+        print('       python3 tools/bench_lane_cnn.py --override configs/cnn_option_b_fast.yaml')
+        print('       python3 tools/bench_lane_cnn.py --override configs/cnn_option_b_fast.yaml --watch --source csi')
         print('  2. Mo giao dien JupyterLab (tune_lane.ipynb):')
         print('       jupyter lab --ip=0.0.0.0 --no-browser')
-        print('  3. Hoac chay thang bang CLI:')
+        print('  3. Hoac chay thang bang CLI (khong ton CPU ve UI -> FPS cao nhat):')
         print('       python3 -m src.jetracer_baseline.cli run --task speed --driver nvidia '
-              '--override configs/cnn_option_b.yaml --record')
+              '--override configs/cnn_option_b_fast.yaml --record')
         return 0
     print('Co buoc bi loi - xem chi tiet o tren.')
     return 1
