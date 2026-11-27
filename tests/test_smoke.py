@@ -2090,6 +2090,780 @@ def test_speed_track_ui_option_b_panel_and_recent_run_gate():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def test_run_start_survives_slow_driver_init_and_first_frame_latency():
+    """Mo phong dung loi Jetson Nano 5W: driver init cham + inference ~100ms.
+
+    Truoc khi sua:
+      - _write_log_row() khoa _lifecycle_lock moi frame -> bi build_driver() treo
+      - _fps_stale_after = 0.25s + do tu frame START -> vua bam CHAY da bao
+        camera_stall -> _stop_event.set() -> camera dong bang, xe khong chay!
+    Sau khi sua:
+      - camera KHONG bi ngat, preview van song, xe tang ga va chay bam line,
+        log CSV ghi du dong RUNNING va dong sach khi DUNG.
+    """
+    from jetracer_baseline import tuning_ui as tuning_ui_mod
+    from jetracer_baseline.perception.lane_cnn import CnnLaneDetector, SEG_H, SEG_W
+
+    class FakeWidget(object):
+        def __init__(self, value=None, description='', **kwargs):
+            self.value = value
+            self.description = description
+            self.disabled = False
+            self._observers = []
+            for key, item in kwargs.items():
+                setattr(self, key, item)
+
+        def observe(self, callback, names=None):
+            self._observers.append(callback)
+
+    class FakeLayout(object):
+        def __init__(self, **kwargs):
+            self.options = kwargs
+
+    class FakeButton(FakeWidget):
+        def __init__(self, *args, **kwargs):
+            FakeWidget.__init__(self, *args, **kwargs)
+            self._callbacks = []
+
+        def on_click(self, callback):
+            self._callbacks.append(callback)
+
+    class FakeOutput(FakeWidget):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc_value, _traceback):
+            return False
+
+    class FakeController(FakeWidget):
+        def __init__(self, index=0):
+            FakeWidget.__init__(self)
+            self.index = index
+            self.connected = False
+            self.axes = []
+            self.buttons = []
+
+    class FakeBox(FakeWidget):
+        def __init__(self, children):
+            FakeWidget.__init__(self)
+            self.children = children
+
+    class FakeTab(FakeBox):
+        def set_title(self, _idx, _title):
+            pass
+
+    fake_widgets = types.ModuleType('ipywidgets.widgets')
+    fake_widgets.Controller = FakeController
+    fake_widgets.Image = FakeWidget
+    fake_widgets.Output = FakeOutput
+    fake_widgets.HTML = FakeWidget
+    fake_widgets.Text = FakeWidget
+    fake_widgets.BoundedIntText = FakeWidget
+    fake_widgets.BoundedFloatText = FakeWidget
+    fake_widgets.Checkbox = FakeWidget
+    fake_widgets.Dropdown = FakeWidget
+    fake_widgets.IntSlider = FakeWidget
+    fake_widgets.FloatSlider = FakeWidget
+    fake_widgets.Button = FakeButton
+    fake_widgets.Layout = FakeLayout
+    fake_widgets.HBox = FakeBox
+    fake_widgets.VBox = FakeBox
+    fake_widgets.Tab = FakeTab
+    fake_package = types.ModuleType('ipywidgets')
+    fake_package.widgets = fake_widgets
+
+    class SlowOptionBEngine(object):
+        def __init__(self, infer_delay_s=0.09):
+            self.infer_delay_s = infer_delay_s
+            self.closed = False
+            self.calls = 0
+            seg = np.full((1, 3, SEG_H, SEG_W), -5.0, dtype=np.float32)
+            seg[0, 0, 10:64, 34:94] = 5.0
+            seg[0, 1, 10:64, 34:38] = 5.0
+            seg[0, 1, 10:64, 90:94] = 5.0
+            seg[0, 2, 10:64, 62:66] = 5.0
+            self._seg = seg
+            self._reg = np.zeros((1, 3), dtype=np.float32)
+
+        def infer(self, _x):
+            time.sleep(self.infer_delay_s)
+            self.calls += 1
+            return {'seg': self._seg, 'reg': self._reg}
+
+        def close(self):
+            self.closed = True
+
+    class RecordingDriver(object):
+        def __init__(self):
+            self.commands = []
+            self.stopped = 0
+            self.closed = False
+
+        def set(self, steer, throttle):
+            self.commands.append((float(steer), float(throttle)))
+
+        def stop(self):
+            self.stopped += 1
+
+        def close(self):
+            self.closed = True
+            self.stop()
+
+    old_package = sys.modules.get('ipywidgets')
+    old_widgets = sys.modules.get('ipywidgets.widgets')
+    old_build_driver = tuning_ui_mod.build_driver
+    sys.modules['ipywidgets'] = fake_package
+    sys.modules['ipywidgets.widgets'] = fake_widgets
+
+    workdir = tempfile.mkdtemp(prefix='ui_jetson_start_')
+    ui = None
+    slow_eng = SlowOptionBEngine(infer_delay_s=0.09)
+    created_drivers = []
+
+    def slow_build_driver(_kind, _cfg):
+        # Mo phong ServoKit/Blinka/I2C khoi tao cham (~0.35s) trong lan CHAY dau tien
+        time.sleep(0.35)
+        drv = RecordingDriver()
+        created_drivers.append(drv)
+        return drv
+
+    try:
+        tuning_ui_mod.build_driver = slow_build_driver
+        ui = LaneTuningUI(
+            config_path=CONFIG, source_kind='synthetic',
+            driver_kind='nvidia', soft_start_s=0.2,
+            record_dir=workdir, data_root=workdir,
+            control_hz=30.0, simple=True)
+        ui.log_dir = workdir
+        cfg_opt = load_config(
+            CONFIG, [os.path.join(ROOT, 'configs', 'cnn_option_b.yaml')])
+        cfg_opt.set('lane.cnn.engine', '')
+        cfg_opt.set('lane.cnn.check_reg', False)
+        det = CnnLaneDetector(cfg_opt)
+        det.engine = slow_eng
+        ui.engine.cfg = cfg_opt
+        ui.engine.lane = det
+        ui.engine._dirty = False
+        ui.engine.rebuild()
+
+        ui._on_open()
+        # Cho du >= 8 frame de gat cong 2-line (100% two_lines_ok)
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            summary = ui.engine.stats.summary()
+            if summary is not None and summary['n'] >= 8:
+                break
+            time.sleep(0.02)
+        assert ui._grabber is not None and not ui._stop_event.is_set()
+        calls_before_run = slow_eng.calls
+
+        # Bam CHAY khi build_driver mat 0.35s va moi frame CNN mat ~0.09s
+        ui._on_run()
+        assert ui._armed and ui.mode == MODE_AUTO
+        assert len(created_drivers) == 1
+        drv = created_drivers[0]
+        # Trong luc build_driver() chay, _process_loop KHONG bi block boi _lifecycle_lock
+        assert slow_eng.calls > calls_before_run, (
+            '_process_loop bi treo trong luc build_driver() khoi tao')
+
+        # Cho xe nhan nhieu lenh ga duong lien tiep qua nhieu frame (~100ms/frame)
+        # ma KHONG bi false camera_stall hay ngat camera
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            if (ui._run_meter.frames >= 4 and
+                    any(th > 0.05 for _st, th in drv.commands)):
+                break
+            time.sleep(0.02)
+
+        assert ui._armed, (
+            'Xe bi tu dong DISARM ngay sau khi bam CHAY! status=%s'
+            % getattr(ui.status, 'value', ''))
+        assert ui._grabber is not None and not ui._stop_event.is_set(), (
+            'Camera bi ngat ket noi sai ngay sau khi bam CHAY!')
+        assert ui._run_meter.frames >= 4, (
+            'Khong duy tri duoc nhieu frame sau khi CHAY: %d'
+            % ui._run_meter.frames)
+        assert any(th > 0.05 for _st, th in drv.commands), (
+            'Xe khong nhan duoc lenh ga duong nao: %r' % (drv.commands[:10],))
+
+        log_path = ui._logger.path
+        ui._on_disarm()
+        assert not ui._armed and ui.mode == MODE_STOP
+        assert ui._grabber is not None and not ui._stop_event.is_set()
+        with io.open(log_path, encoding='utf-8') as fh:
+            rows = list(csv.DictReader(fh))
+        assert rows[0]['event'] == 'start'
+        assert any(r['state'] == 'RUNNING' for r in rows)
+        assert rows[-1]['event'] == 'stop' and rows[-1]['state'] == 'FINISHED'
+
+        ui.close()
+        ui = None
+        assert slow_eng.closed, 'ui.close() phai goi engine/lane/TensorRT close()'
+        assert drv.closed
+    finally:
+        if ui is not None:
+            ui.close()
+        tuning_ui_mod.build_driver = old_build_driver
+        shutil.rmtree(workdir, ignore_errors=True)
+        if old_package is None:
+            sys.modules.pop('ipywidgets', None)
+        else:
+            sys.modules['ipywidgets'] = old_package
+        if old_widgets is None:
+            sys.modules.pop('ipywidgets.widgets', None)
+        else:
+            sys.modules['ipywidgets.widgets'] = old_widgets
+
+
+def test_control_loop_tolerates_jitter_using_completion_time_but_stops_on_true_stall():
+    """Do stall theo moc HOAN TAT lenh gan nhat + startup grace; stall that van cat ga."""
+    commands = []
+    reasons = []
+
+    class Driver(object):
+        def set(self, steer, throttle):
+            commands.append((steer, throttle))
+            ui._control_stop.set()
+
+        def stop(self):
+            commands.append(('stop', 0.0))
+            ui._control_stop.set()
+
+    class Engine(object):
+        def stop_run(self):
+            pass
+
+    class Shaper(object):
+        def reset(self):
+            pass
+
+    class Button(object):
+        description = ''
+
+    def _make_ui():
+        inst = LaneTuningUI.__new__(LaneTuningUI)
+        inst._lifecycle_lock = threading.RLock()
+        inst._engine_lock = threading.RLock()
+        inst._driver_lock = threading.Lock()
+        inst._state_lock = threading.Lock()
+        inst._control_stop = threading.Event()
+        inst._camera_stopping = threading.Event()
+        inst._stop_event = threading.Event()
+        inst.control_period = 0.001
+        inst.mode = MODE_AUTO
+        inst._armed = True
+        inst._driver = Driver()
+        inst._cv_steer = 0.25
+        inst._cv_throttle = 0.20
+        inst._fps_stale_after = 0.25
+        inst._run_startup_grace_s = 1.0
+        inst._camera_stop_reason = None
+        inst._camera_stop_detail = None
+        inst.engine = Engine()
+        inst.shaper = Shaper()
+        inst.btn_manual = Button()
+        inst.status = type('Status', (object,), {'value': ''})()
+        inst.metrics = type('Metrics', (object,), {'value': ''})()
+        inst._sync_driver_limits = lambda: None
+        inst._finish_run_log = lambda reason: reasons.append(reason)
+        inst._log = lambda _m: None
+        inst._set_status = lambda _m: None
+        inst._metrics_html = lambda: ''
+        inst._fps = 15.0
+        return inst
+
+    # (a) Frame bat dau tu 0.30s truoc nhung VUA hoan tat 0.05s truoc -> KHONG stall
+    ui = _make_ui()
+    now = time.monotonic()
+    ui._run_started_mono = now - 1.0
+    ui._cv_started_mono = now - 0.30
+    ui._cv_updated_mono = now - 0.05
+    ui._control_loop()
+    assert commands == [(0.25, 0.20)], commands
+    assert ui._armed and not ui._stop_event.is_set()
+
+    # (b) Frame hoan tat cach day 0.40s (> 0.25s) -> stall that -> cat ga & dung cam
+    commands[:] = []
+    reasons[:] = []
+    ui = _make_ui()
+    now = time.monotonic()
+    ui._run_started_mono = now - 1.5
+    ui._cv_started_mono = now - 0.50
+    ui._cv_updated_mono = now - 0.40
+    ui._control_loop()
+    assert commands == [('stop', 0.0)], commands
+    assert reasons == ['camera_stall']
+    assert ui._camera_stop_reason == 'camera_stall'
+    assert ui._stop_event.is_set() and not ui._armed
+    assert 'PIPELINE MAT FRAME' in ui.status.value
+
+    # (c) Dang cho frame dau tien sau CHAY trong startup_grace (0.40s < 1.0s) -> gui neutral (0, 0)
+    commands[:] = []
+    reasons[:] = []
+    ui = _make_ui()
+    now = time.monotonic()
+    ui._run_started_mono = now - 0.40
+    ui._cv_started_mono = now - 0.45
+    ui._cv_updated_mono = now - 0.42
+    ui._control_loop()
+    assert commands == [(0.0, 0.0)], commands
+    assert ui._armed and not ui._stop_event.is_set()
+
+    # (d) Qua startup_grace (1.20s > 1.0s) ma van khong co frame sau CHAY -> stall & cat ga
+    commands[:] = []
+    reasons[:] = []
+    ui = _make_ui()
+    now = time.monotonic()
+    ui._run_started_mono = now - 1.20
+    ui._cv_started_mono = None
+    ui._cv_updated_mono = None
+    ui._control_loop()
+    assert commands == [('stop', 0.0)], commands
+    assert reasons == ['camera_stall']
+    assert ui._stop_event.is_set() and not ui._armed
+
+
+def test_finalize_camera_loop_preserves_error_banner_and_releases_before_clearing_grabber():
+    """Finalizer phai giu nguyen thong bao loi va nha camera truoc khi xoa _grabber."""
+    events = []
+
+    class FakeGrabber(object):
+        def stop(self):
+            events.append(('grabber_stop', ui._grabber is self))
+
+    ui = LaneTuningUI.__new__(LaneTuningUI)
+    ui._lifecycle_lock = threading.RLock()
+    ui._record_lock = threading.Lock()
+    ui._writer_lock = threading.Lock()
+    ui._camera_stopping = threading.Event()
+    ui._recorder = None
+    ui._writer = None
+    ui.status = type('Status', (object,), {'value': ''})()
+    ui._log = lambda _m: None
+    ui._disarm_locked = lambda reason: events.append(('disarm', reason))
+
+    # (a) camera_stall -> phai giu ly do trong status, khong ghi de bang thong bao chung
+    grabber = FakeGrabber()
+    ui._grabber = grabber
+    ui._camera_stop_reason = 'camera_stall'
+    ui._camera_stop_detail = 'command qua han 0.80s > 0.75s'
+    ui._finalize_camera_loop(grabber, 'camera_stall')
+    assert events == [('disarm', 'camera_stall'), ('grabber_stop', True)], events
+    assert ui._grabber is None
+    assert 'PIPELINE MAT FRAME' in ui.status.value
+    assert '0.80s' in ui.status.value
+
+    # (b) camera_error -> phai hien loi camera goc trong status
+    events[:] = []
+    grabber2 = FakeGrabber()
+    ui._grabber = grabber2
+    ui._camera_stop_reason = 'camera_error'
+    ui._camera_stop_detail = 'csi-gstreamer mat frame'
+    ui._finalize_camera_loop(grabber2, 'camera_error')
+    assert 'MAT KET NOI CAMERA' in ui.status.value
+    assert 'csi-gstreamer mat frame' in ui.status.value
+
+    # (c) camera_stop binh thuong -> hien trang thai thuong
+    events[:] = []
+    grabber3 = FakeGrabber()
+    ui._grabber = grabber3
+    ui._camera_stop_reason = None
+    ui._camera_stop_detail = None
+    ui._finalize_camera_loop(grabber3, 'camera_stop')
+    assert 'camera da dung; bam MO CAMERA de mo lai' in ui.status.value
+
+
+def test_csi_source_recovers_transient_runtime_drop_and_fails_on_permanent_loss():
+    """CSISource chiu duoc rot 1-2 frame tam thoi, nhung van bao loi khi mat cam that."""
+    import jetracer_baseline.camera as camera_mod
+
+    frame = np.full((12, 16, 3), 99, dtype=np.uint8)
+
+    class FakeCapture(object):
+        def __init__(self, reads):
+            self.reads = list(reads)
+            self.released = False
+
+        def isOpened(self):
+            return True
+
+        def read(self):
+            if not self.reads:
+                return False, None
+            return self.reads.pop(0)
+
+        def release(self):
+            self.released = True
+
+    # Frame 1 = warmup OK; sau do 2 lan False tam thoi -> frame OK; cuoi cung mat han
+    cap = FakeCapture([
+        (True, frame),
+        (False, None),
+        (False, None),
+        (True, frame),
+        (False, None),
+        (False, None),
+        (False, None),
+    ])
+    original = camera_mod.cv2.VideoCapture
+    camera_mod.cv2.VideoCapture = lambda *_args, **_kwargs: cap
+    source = None
+    try:
+        source = CSISource(
+            640, 480, 30, allow_usb_fallback=False,
+            startup_attempts=1, startup_delay_s=0.0,
+            csi_open_attempts=1, csi_retry_delay_s=0.0,
+            runtime_read_retries=3, runtime_retry_delay_s=0.0)
+        ok0, f0 = source.read()
+        assert ok0 and f0 is not None
+
+        # Rot 2 frame tam thoi -> tu phuc hoi trong read() thu 2
+        ok1, f1 = source.read()
+        assert ok1 and f1 is not None and source.last_error is None
+
+        # Mat 3 frame lien tiep -> tra False va ghi last_error ro rang
+        ok2, f2 = source.read()
+        assert (not ok2) and f2 is None
+        assert source.last_error and '3 lan doc lien tiep' in source.last_error
+    finally:
+        if source is not None:
+            source.release()
+        camera_mod.cv2.VideoCapture = original
+
+
+def test_cnn_sorted_median_matches_numpy_median():
+    """_sorted_median phai trung khop tuyet doi voi np.median tren mang da sap xep."""
+    from jetracer_baseline.perception.lane_cnn import CnnLaneDetector
+
+    for length in range(1, 21):
+        arr = np.sort(np.arange(length, dtype=np.int64) * 3 + 2)
+        assert abs(CnnLaneDetector._sorted_median(arr) - float(np.median(arr))) < 1e-12
+
+
+def test_camera_dying_during_build_driver_aborts_run_and_preserves_error_detail():
+    """Camera chet trong luc build_driver(): KHONG ARM, KHONG tao CSV, KHONG xoa ly do loi."""
+    from jetracer_baseline import tuning_ui as tuning_ui_mod
+
+    workdir = tempfile.mkdtemp(prefix='ui_cam_die_driver_')
+    old_build = tuning_ui_mod.build_driver
+
+    class DummyGrabber(object):
+        def __init__(self):
+            self.eof = False
+            self.error = None
+
+        def stop(self):
+            pass
+
+    class DummyDriver(object):
+        def stop(self):
+            pass
+
+    class DummyButton(object):
+        description = ''
+        button_style = ''
+
+    def _make_ui(grabber):
+        eng = LaneTuningEngine(CONFIG)
+        for _ in range(20):
+            eng.stats.push(0.0, 0.0, True, 6)
+        ui = LaneTuningUI.__new__(LaneTuningUI)
+        ui._lifecycle_lock = threading.RLock()
+        ui._engine_lock = threading.RLock()
+        ui._driver_lock = threading.Lock()
+        ui._state_lock = threading.Lock()
+        ui._logger_lock = threading.Lock()
+        ui._record_lock = threading.Lock()
+        ui._writer_lock = threading.Lock()
+        ui._camera_stopping = threading.Event()
+        ui._grabber = grabber
+        ui._driver = None
+        ui.driver_kind = 'nvidia'
+        ui.mode = MODE_STOP
+        ui._armed = False
+        ui.engine = eng
+        ui.log_dir = workdir
+        ui._logger = None
+        ui._recorder = None
+        ui._writer = None
+        ui._run_mode = MODE_STOP
+        ui._run_started_mono = None
+        ui._run_meter = ProcessingFpsMeter(60)
+        ui._fps_stale_after = 0.75
+        ui._last_run_summary = None
+        ui._camera_stop_reason = None
+        ui._camera_stop_detail = None
+        ui.btn_log = DummyButton()
+        ui.btn_manual = DummyButton()
+        ui.shaper = ControllerShaper(_cfg())
+        ui.status = type('Status', (object,), {'value': ''})()
+        ui._ensure_control_thread = lambda: None
+        ui._controller_ready = lambda: True
+        ui._read_sticks = lambda: (0.0, 0.0)
+        ui._logs = []
+        ui._log = lambda m: ui._logs.append(m)
+        return ui
+
+    try:
+        # (a) _on_run_locked: camera loi giua luc build_driver() dang chay
+        grab1 = DummyGrabber()
+        ui1 = _make_ui(grab1)
+
+        def dying_driver_run(_kind, _cfg_obj):
+            grab1.eof = True
+            grab1.error = IOError('nvargus died during driver init')
+            ui1._camera_stop_reason = 'camera_error'
+            ui1._camera_stop_detail = 'nvargus died during driver init'
+            ui1._camera_stopping.set()
+            return DummyDriver()
+
+        tuning_ui_mod.build_driver = dying_driver_run
+        ui1._on_run_locked()
+        assert not ui1._armed and ui1.mode == MODE_STOP
+        assert ui1._logger is None
+        assert ui1._camera_stop_reason == 'camera_error'
+        assert ui1._camera_stop_detail == 'nvargus died during driver init'
+        assert os.listdir(workdir) == [], 'Khong duoc tao file CSV khi camera da chet'
+
+        # Finalizer sau do van giu nguyen thong bao loi goc tren status
+        ui1._finalize_camera_loop(grab1, 'camera_error')
+        assert 'MAT KET NOI CAMERA' in ui1.status.value
+        assert 'nvargus died during driver init' in ui1.status.value
+
+        # (b) _enter_mode_locked (MODE_MANUAL): cung phai huy va khong tao CSV
+        grab2 = DummyGrabber()
+        ui2 = _make_ui(grab2)
+
+        def dying_driver_manual(_kind, _cfg_obj):
+            grab2.eof = True
+            grab2.error = IOError('csi died in manual init')
+            ui2._camera_stop_reason = 'camera_error'
+            ui2._camera_stop_detail = 'csi died in manual init'
+            ui2._camera_stopping.set()
+            return DummyDriver()
+
+        tuning_ui_mod.build_driver = dying_driver_manual
+        ok = ui2._enter_mode_locked(MODE_MANUAL)
+        assert ok is False
+        assert not ui2._armed and ui2.mode == MODE_STOP
+        assert ui2._logger is None
+        assert ui2._camera_stop_detail == 'csi died in manual init'
+        assert os.listdir(workdir) == []
+    finally:
+        tuning_ui_mod.build_driver = old_build
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_tensorrt_engine_init_pops_and_detaches_context_on_keyboard_interrupt():
+    """KeyboardInterrupt trong TensorRTEngine.__init__ phai pop + detach primary context."""
+    from jetracer_baseline.perception.lane_cnn import TensorRTEngine
+
+    ops = []
+
+    class FakeContext(object):
+        def push(self):
+            ops.append('push')
+
+        def pop(self):
+            ops.append('pop')
+
+        def detach(self):
+            ops.append('detach')
+
+    class FakeDevice(object):
+        def __init__(self, _idx):
+            pass
+
+        def retain_primary_context(self):
+            ops.append('retain')
+            return FakeContext()
+
+    class FakeLogger(object):
+        WARNING = 1
+
+        def __init__(self, _level):
+            pass
+
+    class FakeRuntime(object):
+        def __init__(self, _logger):
+            pass
+
+        def deserialize_cuda_engine(self, _buf):
+            raise KeyboardInterrupt('simulated Ctrl-C during deserialize')
+
+    fake_trt = types.ModuleType('tensorrt')
+    fake_trt.Logger = FakeLogger
+    fake_trt.Runtime = FakeRuntime
+
+    fake_cuda_drv = types.ModuleType('pycuda.driver')
+    fake_cuda_drv.init = lambda: ops.append('init')
+    fake_cuda_drv.Device = FakeDevice
+    fake_pycuda = types.ModuleType('pycuda')
+    fake_pycuda.driver = fake_cuda_drv
+
+    old_trt = sys.modules.get('tensorrt')
+    old_pycuda = sys.modules.get('pycuda')
+    old_pycuda_drv = sys.modules.get('pycuda.driver')
+    sys.modules['tensorrt'] = fake_trt
+    sys.modules['pycuda'] = fake_pycuda
+    sys.modules['pycuda.driver'] = fake_cuda_drv
+
+    fd, tmp_engine = tempfile.mkstemp(prefix='fake_trt_', suffix='.engine')
+    os.write(fd, b'fake-engine-bytes')
+    os.close(fd)
+    try:
+        raised = False
+        try:
+            TensorRTEngine(tmp_engine)
+        except KeyboardInterrupt:
+            raised = True
+        assert raised, 'KeyboardInterrupt phai duoc truyen ra ngoai'
+        # Stack context phai can bang (so push == so pop) va phai detach
+        assert ops.count('push') == ops.count('pop'), ops
+        assert 'detach' in ops, ops
+        assert ops[-1] == 'detach', ops
+    finally:
+        if os.path.exists(tmp_engine):
+            os.remove(tmp_engine)
+        for name, old in (('tensorrt', old_trt), ('pycuda', old_pycuda),
+                          ('pycuda.driver', old_pycuda_drv)):
+            if old is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = old
+
+
+def test_write_log_row_waits_for_arm_once_logger_is_attached():
+    """Khi _logger da gan (nhung _armed chua bat), _write_log_row phai cho, khong bo sot frame."""
+    workdir = tempfile.mkdtemp(prefix='ui_write_log_race_')
+
+    class Btn(object):
+        description = ''
+        button_style = ''
+
+    class Lane(object):
+        cte = 0.05
+        cte_lookahead = 0.08
+        curvature = 0.01
+        found = True
+        n_bands = 6
+
+    ui = LaneTuningUI.__new__(LaneTuningUI)
+    ui.log_dir = workdir
+    ui._logger = None
+    ui._logger_lock = threading.Lock()
+    ui._lifecycle_lock = threading.RLock()
+    ui._state_lock = threading.Lock()
+    ui._run_mode = MODE_STOP
+    ui._run_started_mono = None
+    ui._run_meter = ProcessingFpsMeter(60)
+    ui._fps_stale_after = 0.75
+    ui._last_run_summary = None
+    ui.btn_log = Btn()
+    ui._armed = False
+    ui._log = lambda _m: None
+
+    result = {
+        'lane': Lane(), 'mode': 'THANG', 'steer': 0.1, 'throttle': 0.2,
+        'servo_clipped': False,
+    }
+    try:
+        # (a) Chua ARM va chua co _logger -> fast-path KHONG bi chan boi _lifecycle_lock
+        done_unarmed = threading.Event()
+        with ui._lifecycle_lock:
+            def call_unarmed():
+                ui._write_log_row(result, 1, time.time(), time.monotonic(), 5.0,
+                                  pipeline_started_mono=time.monotonic())
+                done_unarmed.set()
+            t1 = threading.Thread(target=call_unarmed)
+            t1.start()
+            assert done_unarmed.wait(0.5), '_write_log_row khong duoc block khi chua mo logger'
+            t1.join(0.5)
+
+        # (b) _start_run_log da gan _logger trong _lifecycle_lock nhung _armed chua True
+        #     -> _write_log_row phai doi _lifecycle_lock va ghi du frame dau tien
+        done_first = threading.Event()
+        with ui._lifecycle_lock:
+            assert ui._start_run_log(MODE_AUTO)
+            started = ui._run_started_mono
+            assert ui._logger is not None and not ui._armed
+
+            def call_first_frame():
+                ui._write_log_row(result, 42, time.time(), time.monotonic(), 5.0,
+                                  pipeline_started_mono=started + 0.001)
+                done_first.set()
+
+            t2 = threading.Thread(target=call_first_frame)
+            t2.start()
+            time.sleep(0.03)
+            assert not done_first.is_set(), (
+                '_write_log_row bo sot frame dau tien truoc khi _armed=True')
+            ui._armed = True
+        assert done_first.wait(1.0)
+        t2.join(1.0)
+        assert ui._run_meter.frames == 1
+        summary = ui._finish_run_log('stop')
+        with io.open(summary['path'], encoding='utf-8') as fh:
+            rows = list(csv.DictReader(fh))
+        assert any(r['frame_id'] == '42' and r['state'] == 'RUNNING' for r in rows), rows
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_csi_source_release_nulls_cap_before_releasing():
+    """CSISource.release() phai gan self.cap=None TRUOC khi goi cap.release()."""
+    import jetracer_baseline.camera as camera_mod
+
+    frame = np.full((12, 16, 3), 55, dtype=np.uint8)
+    cap_was_none_during_release = []
+    source_box = []
+
+    class InspectingCapture(object):
+        def __init__(self):
+            self.read_calls = 0
+            self.released = False
+
+        def isOpened(self):
+            return True
+
+        def read(self):
+            self.read_calls += 1
+            if self.read_calls == 1:
+                return True, frame
+            return False, None
+
+        def release(self):
+            cap_was_none_during_release.append(source_box[0].cap is None)
+            self.released = True
+
+    cap = InspectingCapture()
+    original = camera_mod.cv2.VideoCapture
+    camera_mod.cv2.VideoCapture = lambda *_args, **_kwargs: cap
+    source = None
+    try:
+        source = CSISource(
+            640, 480, 30, allow_usb_fallback=False,
+            startup_attempts=1, startup_delay_s=0.0,
+            csi_open_attempts=1, csi_retry_delay_s=0.0,
+            runtime_read_retries=3, runtime_retry_delay_s=0.0)
+        source_box.append(source)
+        ok, f = source.read()
+        assert ok and f is not None
+
+        source.release()
+        assert cap.released
+        assert cap_was_none_during_release == [True], cap_was_none_during_release
+        # Doc sau khi release khong duoc goi cap.read() nua
+        reads_before = cap.read_calls
+        ok_after, f_after = source.read()
+        assert (not ok_after) and f_after is None
+        assert cap.read_calls == reads_before
+    finally:
+        if source is not None:
+            source.release()
+        camera_mod.cv2.VideoCapture = original
+
+
 if __name__ == '__main__':
     failures = 0
     for name, fn in sorted(list(globals().items())):

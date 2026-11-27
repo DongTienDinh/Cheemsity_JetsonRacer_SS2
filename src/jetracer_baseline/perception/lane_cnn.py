@@ -102,13 +102,6 @@ class TensorRTEngine(object):
                 'Tren laptop: dat lane.cnn.backend=onnx de chay bang ONNXRuntime,\n'
                 'hoac lane.cnn.engine rong de chi dung hau xu ly.'
                 % exc)
-        import threading
-        self._cuda = cuda
-        self._ctx = cuda.Device(0).retain_primary_context()
-        # TensorRT execution context KHONG an toan da luong. Giao dien co ca
-        # thread camera lan thread dieu khien -> phai khoa.
-        self._lock = threading.Lock()
-
         if not os.path.isfile(engine_path):
             raise IOError(
                 'Khong thay engine: %s\n'
@@ -117,12 +110,29 @@ class TensorRTEngine(object):
                 '--fp16 --workspace=256 --saveEngine=%s'
                 % (engine_path, engine_path))
 
+        import threading
+        self._cuda = cuda
+        self._ctx = cuda.Device(0).retain_primary_context()
+        self._closed = False
+        self.engine = None
+        self.context = None
+        self.stream = None
+        self.host, self.dev, self.names, self.shapes = [], [], [], []
+        self.in_idx, self.out_idx = [], []
+        # TensorRT execution context KHONG an toan da luong. Giao dien co ca
+        # thread camera lan thread dieu khien -> phai khoa.
+        self._lock = threading.Lock()
+
         logger = trt.Logger(trt.Logger.WARNING)
         self._ctx.push()
         try:
-            self._build(trt, cuda, engine_path, logger)
-        finally:
-            self._ctx.pop()
+            try:
+                self._build(trt, cuda, engine_path, logger)
+            finally:
+                self._ctx.pop()
+        except BaseException:
+            self.close()
+            raise
 
     def _build(self, trt, cuda, engine_path, logger):
         with open(engine_path, 'rb') as fh:
@@ -177,11 +187,46 @@ class TensorRTEngine(object):
         Push/pop context moi lan goi de chay duoc tu BAT KY thread nao.
         """
         with self._lock:
+            if self._closed or self._ctx is None:
+                raise RuntimeError('TensorRTEngine da dong')
             self._ctx.push()
             try:
                 return self._infer_locked(x)
             finally:
                 self._ctx.pop()
+
+    def close(self):
+        """Giai phong buffer GPU/TRT TRONG primary context roi moi detach.
+
+        Neu de Python GC pha engine/buffer NGOAI context (vi du `del _det`
+        trong notebook truoc `launch()`), PyCUDA canh bao dead context va ro ri
+        bo nho tren Jetson Nano 4GB.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            ctx = self._ctx
+            self._ctx = None
+            if ctx is None:
+                return
+            try:
+                ctx.push()
+                try:
+                    self.context = None
+                    self.engine = None
+                    self.stream = None
+                    self.dev = []
+                    self.host = []
+                    self.bindings = []
+                finally:
+                    ctx.pop()
+            except Exception:
+                pass
+            try:
+                ctx.detach()
+            except Exception:
+                pass
 
     def _infer_locked(self, x):
         cuda = self._cuda
@@ -305,6 +350,11 @@ class CnnLaneDetector(object):
     def reset(self):
         self._reset_state()
 
+    def close(self):
+        engine = getattr(self, 'engine', None)
+        if engine is not None and hasattr(engine, 'close'):
+            engine.close()
+
     def _warmup(self, n=3):
         """Lan suy dien dau tien cua TensorRT ton hang tram ms. Dot no o day,
         khong phai o frame dau tien cua luot thi."""
@@ -404,11 +454,21 @@ class CnnLaneDetector(object):
         return seg, (None if reg is None else reg.ravel())
 
     @staticmethod
+    def _sorted_median(xs):
+        """Trung vi chinh xac cua mang 1D da sap xep (flatnonzero) trong O(1)."""
+        n = len(xs)
+        mid = n >> 1
+        if n & 1:
+            return float(xs[mid])
+        return 0.5 * (float(xs[mid - 1]) + float(xs[mid]))
+
+    @staticmethod
     def _check_two_lines(white_s, center_s, road_s):
         """Kiem tra da nhan du 2 line trang ben trai + ben phai cua lan duong chua."""
         if white_s is None:
             return False, False, False
         left_rows, right_rows = 0, 0
+        med = CnnLaneDetector._sorted_median
         for y in range(SEG_H // 4, SEG_H):
             w_xs = np.flatnonzero(white_s[y])
             if len(w_xs) == 0:
@@ -417,19 +477,19 @@ class CnnLaneDetector(object):
             if center_s is not None:
                 c_xs = np.flatnonzero(center_s[y])
                 if len(c_xs) >= 1:
-                    ref_cx = float(np.median(c_xs))
+                    ref_cx = med(c_xs)
             if ref_cx is None and road_s is not None:
                 r_xs = np.flatnonzero(road_s[y])
                 if len(r_xs) >= 4:
-                    ref_cx = float(np.median(r_xs))
+                    ref_cx = med(r_xs)
             if ref_cx is None:
                 if (int(w_xs[-1]) - int(w_xs[0])) >= 14:
                     ref_cx = 0.5 * (float(w_xs[0]) + float(w_xs[-1]))
                 else:
                     ref_cx = SEG_W * 0.5
-            if np.any(w_xs < (ref_cx - 4.0)):
+            if float(w_xs[0]) < (ref_cx - 4.0):
                 left_rows += 1
-            if np.any(w_xs > (ref_cx + 4.0)):
+            if float(w_xs[-1]) > (ref_cx + 4.0):
                 right_rows += 1
         has_left = left_rows >= 4
         has_right = right_rows >= 4
@@ -445,12 +505,13 @@ class CnnLaneDetector(object):
             else:
                 clean = road_s
         fb = np.zeros((SEG_H, SEG_W), np.uint8)
+        med = CnnLaneDetector._sorted_median
         for y in range(SEG_H):
             cx = None
             if clean is not None:
                 xs = np.flatnonzero(clean[y])
                 if len(xs) >= 4:
-                    cx = int(np.median(xs))
+                    cx = int(med(xs))
             if cx is None and white_s is not None:
                 w_xs = np.flatnonzero(white_s[y])
                 if len(w_xs) >= 2 and (int(w_xs[-1]) - int(w_xs[0])) >= 14:

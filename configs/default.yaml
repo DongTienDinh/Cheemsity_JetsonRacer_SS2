@@ -20,6 +20,10 @@ camera:
   startup_delay_s: 0.10
   csi_open_attempts: 2
   csi_retry_delay_s: 0.50
+  # Khi dang chay, nvargus/appsink co the rot 1-2 frame tam thoi (rung dien luc
+  # motor bat dau quay hoac CPU spike). Thu doc lai ngan (~0.1s) truoc khi bao mat cam.
+  runtime_read_retries: 5
+  runtime_retry_delay_s: 0.02
   # Khoá auto-exposure/white-balance: đổi sáng giữa lúc chạy là rủi ro domain shift lớn nhất.
   lock_exposure: true
 
@@ -49,9 +53,13 @@ pipeline:
 # CPU/GPU với mục tiêu >=20 FPS của pipeline camera -> CV -> lệnh điều khiển.
 tuning:
   preview_hz: 5
-  # 5 chu ky o muc tieu 20 FPS. Qua moc nay, lenh CV da cu -> cat motor,
-  # dong log voi event=camera_stall va yeu cau mo lai camera.
-  pipeline_stall_s: 0.25
+  # 0.75 s (< watchdog 0.8 s cua driver): du bien do cho Jetson Nano 5W
+  # (TensorRT + shading + SD flush + preview), van cat motor va dong log voi
+  # event=camera_stall neu camera/pipeline treo that.
+  pipeline_stall_s: 0.75
+  # Thoi gian cho frame dau tien sau khi bam CHAY (trong luc nay luon gui
+  # neutral 0.0, 0.0 -> an toan tuyet doi, tranh gia bao stall luc chuyen trang thai).
+  run_startup_grace_s: 2.0
 
 # Lai tay de thu du lieu. min_throttle bu nguong chet co/ESC: khi can vua ra
 # khoi deadzone, lenh bat dau tu 0.12 va tang den 0.30. Hieu chuan tren xe da

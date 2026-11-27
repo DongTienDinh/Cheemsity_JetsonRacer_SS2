@@ -416,6 +416,11 @@ class LaneTuningEngine(object):
     def stop_run(self):
         self._run_t0 = None
 
+    def close(self):
+        lane = getattr(self, 'lane', None)
+        if lane is not None and hasattr(lane, 'close'):
+            lane.close()
+
     @property
     def running(self):
         return self._run_t0 is not None
@@ -836,10 +841,15 @@ class LaneTuningUI(object):
         self._run_meter = ProcessingFpsMeter(
             self.engine.get_param('pipeline.fps_window', 60))
         camera_fps = float(self.engine.get_param('camera.fps', 30.0))
-        default_stall_s = max(0.25, 2.5 / max(1.0, camera_fps))
+        default_stall_s = max(0.75, 2.5 / max(1.0, camera_fps))
         self._fps_stale_after = max(
             0.10, float(self.engine.get_param(
                 'tuning.pipeline_stall_s', default_stall_s)))
+        default_grace_s = max(2.0, 2.5 * self._fps_stale_after)
+        self._run_startup_grace_s = max(
+            self._fps_stale_after,
+            float(self.engine.get_param(
+                'tuning.run_startup_grace_s', default_grace_s)))
         self.record_dir = record_dir
         self.record_fps = float(record_fps)
         self._recorder = None
@@ -853,6 +863,10 @@ class LaneTuningUI(object):
         self._cv_steer = 0.0
         self._cv_throttle = 0.0
         self._cv_started_mono = None
+        self._cv_updated_mono = None
+        self._camera_stop_reason = None
+        self._camera_stop_detail = None
+        self._output_lock = threading.Lock()
         self._man_steer = 0.0
         self._man_throttle = 0.0
         self._stick_raw = (0.0, 0.0)
@@ -1081,11 +1095,26 @@ class LaneTuningUI(object):
             self._log('Khong bat duoc sua mau: %s' % exc)
 
     def _log(self, message):
-        with self.output:
-            print('[%s] %s' % (time.strftime('%H:%M:%S'), message))
+        lock = getattr(self, '_output_lock', None)
+        if lock is not None:
+            with lock:
+                with self.output:
+                    print('[%s] %s' % (time.strftime('%H:%M:%S'), message))
+        else:
+            with self.output:
+                print('[%s] %s' % (time.strftime('%H:%M:%S'), message))
 
     def _set_status(self, message):
         self.status.value = '<b>Trang thai:</b> %s' % message
+
+    def _set_error_status(self, message):
+        status_widget = getattr(self, 'status', None)
+        if status_widget is not None:
+            status_widget.value = (
+                '<div style="padding:8px;border-radius:4px;background:#b00020;'
+                'color:#fff;font-weight:bold">%s</div>' % message)
+        else:
+            self._set_status(message)
 
     # -------------------------------------------------------------------- loop
     def _loop(self, grabber):
@@ -1094,11 +1123,11 @@ class LaneTuningUI(object):
             stop_reason = self._process_loop(grabber)
         except Exception as exc:
             stop_reason = 'pipeline_error'
+            self._camera_stop_reason = stop_reason
+            self._camera_stop_detail = str(exc)
             try:
                 self._log('LOI PIPELINE -> DISARM: %s' % exc)
-                self.status.value = (
-                    '<div style="padding:8px;background:#b00020;color:#fff;'
-                    'font-weight:bold">PIPELINE DA DUNG DO LOI: %s</div>' % exc)
+                self._set_error_status('PIPELINE DA DUNG DO LOI: %s' % exc)
             except Exception:
                 pass
         finally:
@@ -1126,6 +1155,8 @@ class LaneTuningUI(object):
                     if grabber.error is not None:
                         self._log('CAMERA DUNG DO LOI: %s' % grabber.error)
                         stop_reason = 'camera_error'
+                        self._camera_stop_reason = stop_reason
+                        self._camera_stop_detail = str(grabber.error)
                     else:
                         self._log('Nguon camera/video da het.')
                         stop_reason = 'camera_eof'
@@ -1148,23 +1179,24 @@ class LaneTuningUI(object):
                 # tuong model "detect ra mot cuc do roi khong doi" chu khong
                 # biet la da co loi. Mat ca buoi de tim ra.
                 self._log('LOI XU LY -> DISARM: %s' % exc)
-                self.status.value = (
-                    '<div style="padding:8px;border-radius:4px;background:#b00020;'
-                    'color:#fff;font-weight:bold">DA DUNG VI LOI XU LY - '
-                     'panel ben duoi la KHUNG HINH CU, khong phai ket qua moi.'
-                     '<br>%s</div>' % exc)
+                self._set_error_status(
+                    'DA DUNG VI LOI XU LY - panel ben duoi la KHUNG HINH CU, '
+                    'khong phai ket qua moi.<br>%s' % exc)
                 stop_reason = 'processing_error'
+                self._camera_stop_reason = stop_reason
+                self._camera_stop_detail = str(exc)
                 self._camera_stopping.set()
                 break
 
             # Cong bo lenh CV la bien CUOI cua pipeline can do. Render/JPEG
             # khong nam trong do va duoc day sang preview worker phia duoi.
+            completed = time.monotonic()
             with self._state_lock:
                 self._cv_steer = result['steer']
                 self._cv_throttle = result['throttle']
                 self._cv_started_mono = pipeline_t0
+                self._cv_updated_mono = completed
 
-            completed = time.monotonic()
             pipeline_latency_ms = (completed - pipeline_t0) * 1000.0
             self._fps = self._pipeline_meter.tick(completed)
             last_result = result
@@ -1179,16 +1211,19 @@ class LaneTuningUI(object):
                 last_preview = completed
                 self._queue_preview(result)
 
+        if stop_reason == 'camera_stop':
+            recorded = getattr(self, '_camera_stop_reason', None)
+            if recorded:
+                stop_reason = recorded
         return stop_reason
 
     def _finalize_camera_loop(self, grabber, stop_reason):
         self._camera_stopping.set()
-        # Camera dung va DISARM la mot transition. Neu bam CHAY dung luc camera
-        # loi, khoa nay ngan logger/ARM "song lai" sau khi thread da dung.
+        # Camera dung va DISARM la mot transition. Cat motor & chot log NGAY
+        # lap tuc, nhung chi xoa self._grabber SAU khi grabber.stop() da nha
+        # xong CSI/CameraLease de bam MO CAMERA ngay khong bi loi chiem cam.
         try:
             with self._lifecycle_lock:
-                if self._grabber is grabber:
-                    self._grabber = None
                 self._disarm_locked(stop_reason)
         except Exception as exc:
             try:
@@ -1220,7 +1255,29 @@ class LaneTuningUI(object):
         except Exception:
             pass
         try:
-            self._set_status('camera da dung; bam MO CAMERA de mo lai')
+            with self._lifecycle_lock:
+                if self._grabber is grabber:
+                    self._grabber = None
+                if self._grabber is None:
+                    detail = getattr(self, '_camera_stop_detail', None)
+                    if stop_reason == 'camera_stall':
+                        msg = ('DA DUNG - PIPELINE MAT FRAME (motor=0)%s. '
+                               'Bam 1. MO CAMERA de mo lai.'
+                               % (': ' + detail if detail else ''))
+                        self._set_error_status(msg)
+                    elif stop_reason == 'camera_error':
+                        msg = ('MAT KET NOI CAMERA -> DA DUNG (motor=0)%s. '
+                               'Bam 1. MO CAMERA de mo lai.'
+                               % (': ' + detail if detail else ''))
+                        self._set_error_status(msg)
+                    elif stop_reason in ('processing_error', 'pipeline_error'):
+                        msg = ('DA DUNG VI LOI XU LY (motor=0)%s. '
+                               'Bam 1. MO CAMERA de mo lai.'
+                               % (': ' + detail if detail else ''))
+                        self._set_error_status(msg)
+                    else:
+                        self._set_status(
+                            'camera da dung; bam MO CAMERA de mo lai')
         except Exception:
             pass
 
@@ -1362,6 +1419,12 @@ class LaneTuningUI(object):
 
     def _write_log_row(self, result, frame_id, now, completed,
                        pipeline_latency_ms, pipeline_started_mono=None):
+        # Fast-path khi chua ARM va chua mo logger: KHONG tranh _lifecycle_lock
+        # voi build_driver() luc bam CHAY lan dau, tranh lam treo _process_loop
+        # 1-2s khi khoi tao I2C. Khi _start_run_log() da gan self._logger, vao
+        # _lifecycle_lock de doi self._armed=True, khong bo sot frame dau tien.
+        if not self._armed and self._logger is None:
+            return
         res = result['lane']
         error = None
         # Doi transition CHAY hoan tat. Frame bat dau luc UI con DUNG khong
@@ -1553,31 +1616,55 @@ class LaneTuningUI(object):
                         steer = self._cv_steer
                         throttle = self._cv_throttle
                         cv_started_mono = self._cv_started_mono
+                        cv_updated_mono = getattr(self, '_cv_updated_mono', None)
                     # Lenh sinh tu frame bat dau truoc moc CHAY la lenh cu.
-                    # Gui neutral den khi co completion dau tien cua luot moi.
+                    # Gui neutral (0, 0) den khi co completion dau tien cua luot moi.
+                    stall_detail = None
                     if (self._run_started_mono is None or
                             cv_started_mono is None or
                             cv_started_mono < self._run_started_mono):
                         steer, throttle = 0.0, 0.0
+                        startup_grace = max(
+                            self._fps_stale_after,
+                            float(getattr(self, '_run_startup_grace_s',
+                                          self._fps_stale_after)))
                         if (self._run_started_mono is not None and
-                                t0 - self._run_started_mono >
-                                self._fps_stale_after):
+                                t0 - self._run_started_mono > startup_grace):
                             camera_stall = True
-                    elif t0 - cv_started_mono > self._fps_stale_after:
-                        steer, throttle = 0.0, 0.0
-                        camera_stall = True
+                            stall_detail = (
+                                'khong co frame moi sau khi bam CHAY '
+                                '(%.2fs > %.2fs)'
+                                % (t0 - self._run_started_mono, startup_grace))
+                    else:
+                        # Do do tre tu thoi diem HOAN TAT lenh gan nhat (fallback
+                        # ve cv_started_mono neu unit test khoi tao bang __new__).
+                        ref_mono = (cv_updated_mono
+                                    if (cv_updated_mono is not None and
+                                        cv_updated_mono >= cv_started_mono)
+                                    else cv_started_mono)
+                        if t0 - ref_mono > self._fps_stale_after:
+                            steer, throttle = 0.0, 0.0
+                            camera_stall = True
+                            stall_detail = (
+                                'command qua han %.2fs > %.2fs'
+                                % (t0 - ref_mono, self._fps_stale_after))
                 else:
                     steer, throttle = 0.0, 0.0
                     self.shaper.reset()
 
                 if camera_stall and self._armed:
+                    self._camera_stop_reason = 'camera_stall'
+                    self._camera_stop_detail = stall_detail
                     self._camera_stopping.set()
                     self._stop_event.set()
                     self._fps = 0.0
-                    self._log('PIPELINE MAT FRAME -> dung xe (command qua %.2fs)'
-                              % self._fps_stale_after)
+                    self._log('PIPELINE MAT FRAME -> dung xe (%s)'
+                              % (stall_detail or ('command qua %.2fs'
+                                                  % self._fps_stale_after)))
                     self._disarm_locked('camera_stall')
-                    self._set_status('DA DUNG - pipeline mat frame, motor=0')
+                    self._set_error_status(
+                        'DA DUNG - PIPELINE MAT FRAME (motor=0)%s'
+                        % (': ' + stall_detail if stall_detail else ''))
                     self.metrics.value = self._metrics_html()
                 elif self._armed and self._driver is not None:
                     with self._driver_lock:
@@ -1591,6 +1678,8 @@ class LaneTuningUI(object):
                 if driver_error is not None:
                     self._log('LOI DRIVER -> dung xe: %s' % driver_error)
                     self._disarm_locked('driver_error')
+                    self._set_error_status(
+                        'LOI DRIVER -> DA DUNG (motor=0): %s' % driver_error)
 
             sleep = self.control_period - (time.monotonic() - t0)
             if sleep > 0:
@@ -1838,6 +1927,15 @@ class LaneTuningUI(object):
             self._log('Khong mo duoc driver %s: %s' % (self.driver_kind, exc))
             return False
 
+        # Kiem tra lai camera sau build_driver(): neu camera chet trong luc
+        # khoi tao I2C/ServoKit thi huy chuyen che do, khong tao log rong va
+        # khong ghi de ly do loi camera.
+        if (self._grabber is None or self._camera_stopping.is_set() or
+                getattr(self._grabber, 'eof', False) or
+                getattr(self._grabber, 'error', None) is not None):
+            self._log('Camera da dung trong luc khoi tao driver -> khong chay.')
+            return False
+
         try:
             self.shaper.reset_from_config(self.engine.cfg)
             self.shaper.reset()
@@ -1886,6 +1984,13 @@ class LaneTuningUI(object):
 
     # ----------------------------------------------------------------- buttons
     def _on_open(self, _b=None):
+        # Cho thread camera cu thoat han (va nha CSI/CameraLease) NGOAI
+        # _lifecycle_lock de tranh deadlock voi _finalize_camera_loop().
+        old_thread = self._thread
+        if (self._camera_stopping.is_set() and old_thread is not None and
+                old_thread.is_alive() and
+                old_thread is not threading.current_thread()):
+            old_thread.join(timeout=2.0)
         with self._lifecycle_lock:
             return self._on_open_locked(_b)
 
@@ -1914,16 +2019,21 @@ class LaneTuningUI(object):
                     source.release()
                 except Exception:
                     pass
-            self._set_status('KHONG MO DUOC CAMERA')
+            self._set_error_status('KHONG MO DUOC CAMERA: %s' % exc)
             self._log('Loi mo camera: %s' % exc)
             return
 
         try:
             self._grabber = grabber
+            self._camera_stop_reason = None
+            self._camera_stop_detail = None
             self._camera_stopping.clear()
             self._stop_event.clear()
             self._pipeline_meter.reset()
             self._fps = 0.0
+            with self._state_lock:
+                self._cv_started_mono = None
+                self._cv_updated_mono = None
             self._ensure_preview_thread()
             self._thread = threading.Thread(target=self._loop, args=(grabber,))
             self._thread.daemon = True
@@ -1935,7 +2045,7 @@ class LaneTuningUI(object):
                 grabber.stop()
             except Exception:
                 pass
-            self._set_status('KHONG KHOI DONG DUOC THREAD CAMERA')
+            self._set_error_status('KHONG KHOI DONG DUOC THREAD CAMERA: %s' % exc)
             self._log('Loi khoi dong vong camera: %s' % exc)
             return
         self._set_status('camera dang chay (chua ARM - xe khong chay)')
@@ -1988,20 +2098,34 @@ class LaneTuningUI(object):
                           % recent_loss)
                 self._set_status('TU CHOI CHAY - mask chua on')
                 return
-        # Xoa lich su cu truoc khi chay (frame luc be xe) de thong ke luot chay sach
-        self.engine.stats.reset()
         try:
+            # Khoi tao driver & ghi neutral TRUOC khi reset stats / bat dong ho
+            # _run_started_mono: neu I2C/driver loi thi khong mat stats 2-line va
+            # khong lam dong ho stall chay som trong luc import ServoKit.
             if self._driver is None:
                 self._driver = build_driver(self.driver_kind, self.engine.cfg)
             with self._driver_lock:
                 self._driver.stop()
+            # Kiem tra lai camera sau build_driver(): neu camera chet trong luc
+            # khoi tao I2C/ServoKit thi KHONG xoa _camera_stop_reason/detail,
+            # KHONG tao log CSV rong va KHONG ARM xe.
+            if (self._grabber is None or self._camera_stopping.is_set() or
+                    getattr(self._grabber, 'eof', False) or
+                    getattr(self._grabber, 'error', None) is not None):
+                self._log('Camera da dung trong luc khoi tao driver -> khong chay.')
+                return
+            # Xoa lich su cu truoc khi chay (frame luc be xe) de thong ke luot chay sach
+            self._camera_stop_reason = None
+            self._camera_stop_detail = None
             self.mode = MODE_AUTO
             with self._engine_lock:
+                self.engine.stats.reset()
                 self.engine.start_run()
             with self._state_lock:
                 self._cv_steer = 0.0
                 self._cv_throttle = 0.0
                 self._cv_started_mono = None
+                self._cv_updated_mono = None
             if not self._start_run_log(MODE_AUTO):
                 self.mode = MODE_STOP
                 with self._engine_lock:
@@ -2028,7 +2152,7 @@ class LaneTuningUI(object):
             with self._engine_lock:
                 self.engine.stop_run()
             self._finish_run_log('start_error')
-            self._set_status('LOI DRIVER - xe khong chay')
+            self._set_error_status('LOI DRIVER - xe khong chay: %s' % exc)
             self._log('Khong chay duoc voi driver %s: %s' % (self.driver_kind, exc))
 
     def _disarm(self, reason='stop'):
@@ -2382,6 +2506,12 @@ class LaneTuningUI(object):
             except Exception:
                 pass
             self._driver = None
+        if getattr(self, 'engine', None) is not None and \
+                hasattr(self.engine, 'close'):
+            try:
+                self.engine.close()
+            except Exception:
+                pass
         self._log('Da dong giao dien tune.')
 
 

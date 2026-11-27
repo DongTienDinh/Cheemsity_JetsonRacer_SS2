@@ -182,7 +182,8 @@ class CSISource(FrameSource):
                  allow_usb_fallback=True, usb_index=0,
                  startup_attempts=15, startup_delay_s=0.10,
                  capture_width=1280, capture_height=720, sensor_id=0,
-                 csi_open_attempts=2, csi_retry_delay_s=0.50):
+                 csi_open_attempts=2, csi_retry_delay_s=0.50,
+                 runtime_read_retries=5, runtime_retry_delay_s=0.02):
         self.width = int(width)
         self.height = int(height)
         self.fps = int(fps)
@@ -196,6 +197,8 @@ class CSISource(FrameSource):
         self.sensor_id = int(sensor_id)
         self.csi_open_attempts = max(1, int(csi_open_attempts))
         self.csi_retry_delay_s = max(0.0, float(csi_retry_delay_s))
+        self.runtime_read_retries = max(1, int(runtime_read_retries))
+        self.runtime_retry_delay_s = max(0.0, float(runtime_retry_delay_s))
         self.pipeline = gstreamer_pipeline(
             self.width, self.height, self.fps, self.flip_method,
             capture_width=self.capture_width,
@@ -320,21 +323,36 @@ class CSISource(FrameSource):
             raise IOError(self._failure_message(
                 '%s (%s)' % (self.backend, self.last_error)))
 
-        try:
-            ok, frame = self.cap.read()
-        except Exception as exc:
-            self.last_error = '%s read exception: %s' % (self.backend, exc)
-            raise IOError(self.last_error)
-        if not ok or frame is None:
-            self.last_error = '%s da mo nhung mat frame trong luc chay' % self.backend
-            return False, None
-        return True, frame
+        # Mot lan read() tra False cua nvargus/appsink co the chi la rot frame
+        # tam thoi (rung dien luc motor khoi dong hoac CPU spike). Thu lai
+        # nhanh trong gioi han nho (~0.1s) truoc khi bao mat camera va cat ga.
+        for attempt in range(self.runtime_read_retries):
+            cap = self.cap
+            if cap is None:
+                self.last_error = '%s da dong trong luc doc' % self.backend
+                return False, None
+            try:
+                ok, frame = cap.read()
+            except Exception as exc:
+                self.last_error = '%s read exception: %s' % (self.backend, exc)
+                raise IOError(self.last_error)
+            if ok and frame is not None:
+                self.last_error = None
+                return True, frame
+            if attempt + 1 < self.runtime_read_retries and \
+                    self.runtime_retry_delay_s > 0:
+                time.sleep(self.runtime_retry_delay_s)
+        self.last_error = (
+            '%s da mo nhung mat frame trong luc chay (%d lan doc lien tiep)'
+            % (self.backend, self.runtime_read_retries))
+        return False, None
 
     def release(self):
         try:
-            if self.cap is not None:
-                self.cap.release()
-                self.cap = None
+            cap = self.cap
+            self.cap = None
+            if cap is not None:
+                cap.release()
         finally:
             self._lease.release()
 
@@ -553,4 +571,6 @@ def _build_raw_source(cfg, kind, video_path=None, n_frames=None):
         sensor_id=cfg.get('camera.sensor_id', 0),
         csi_open_attempts=cfg.get('camera.csi_open_attempts', 2),
         csi_retry_delay_s=cfg.get('camera.csi_retry_delay_s', 0.50),
+        runtime_read_retries=cfg.get('camera.runtime_read_retries', 5),
+        runtime_retry_delay_s=cfg.get('camera.runtime_retry_delay_s', 0.02),
     )
