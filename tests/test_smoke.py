@@ -2011,6 +2011,76 @@ def test_speed_track_ui_option_b_panel_and_recent_run_gate():
     panel = engine.render_panel(result, fps=30.0, armed=False, driver_kind='nvidia')
     assert panel.shape[2] == 3 and panel.shape[0] > 480 and panel.shape[1] == 640
 
+    # 3. Cong an toan nut CHAY (_on_run_locked):
+    #    - Chua bat cam -> tu choi
+    #    - Bat cam nhung chi co 1 line (two_lines=False) -> tu choi
+    #    - Nhan du 2 line 2 ben (two_lines=True) -> cho chay & TU DONG tao log CSV
+    workdir = tempfile.mkdtemp(prefix='ui_two_line_gate_')
+    try:
+        class Btn(object):
+            description = ''
+            button_style = ''
+
+        class DummyDrv(object):
+            def stop(self):
+                pass
+
+        ui = LaneTuningUI.__new__(LaneTuningUI)
+        ui._lifecycle_lock = threading.RLock()
+        ui._engine_lock = threading.RLock()
+        ui._driver_lock = threading.Lock()
+        ui._state_lock = threading.Lock()
+        ui._logger_lock = threading.Lock()
+        ui._camera_stopping = threading.Event()
+        ui._grabber = None
+        ui._driver = DummyDrv()
+        ui.driver_kind = 'dryrun'
+        ui.mode = MODE_STOP
+        ui._armed = False
+        ui.engine = engine
+        ui.log_dir = workdir
+        ui._logger = None
+        ui._run_mode = MODE_STOP
+        ui._run_started_mono = None
+        ui._run_meter = ProcessingFpsMeter(60)
+        ui._fps_stale_after = 0.25
+        ui._last_run_summary = None
+        ui.btn_log = Btn()
+        ui.btn_manual = Btn()
+        ui.shaper = ControllerShaper(_cfg())
+        ui._ensure_control_thread = lambda: None
+        logs = []
+        ui._log = lambda m: logs.append(m)
+        ui._set_status = lambda _s: None
+
+        # (a) Chua mo camera -> tu choi
+        ui._on_run_locked()
+        assert not ui._armed and any('MO CAMERA' in m for m in logs)
+
+        # (b) Mo camera nhung chi thay 1 line (two_lines=False) -> tu choi
+        ui._grabber = object()
+        engine.stats.reset()
+        for _ in range(15):
+            engine.stats.push(0.0, 0.0, True, 6, two_lines=False)
+        logs[:] = []
+        ui._on_run_locked()
+        assert not ui._armed and any('2 line 2 ben' in m for m in logs)
+
+        # (c) Truoc do be xe mat vach 50 frame, roi dat vao du 2 line 20 frame (~0.7s) -> CHAY + TAO LOG
+        engine.stats.reset()
+        for _ in range(50):
+            engine.stats.push(0.0, 0.0, False, 0, two_lines=False)
+        for _ in range(20):
+            engine.stats.push(0.0, 0.0, True, 8, two_lines=True)
+        logs[:] = []
+        ui._on_run_locked()
+        assert ui._armed and ui.mode == MODE_AUTO
+        assert ui._logger is not None and os.path.isfile(ui._logger.path)
+        ui._disarm_locked('stop')
+        assert not ui._armed
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
 
 if __name__ == '__main__':
     failures = 0

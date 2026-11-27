@@ -134,8 +134,9 @@ class RollingStats(object):
         self._steer = []
         self._found = []
         self._bands = []
+        self._two_lines = []
 
-    def push(self, cte, steer, found, bands):
+    def push(self, cte, steer, found, bands, two_lines=None):
         with self._lock:
             for buf, value in ((self._cte, cte), (self._steer, steer),
                                (self._found, 1.0 if found else 0.0),
@@ -143,10 +144,15 @@ class RollingStats(object):
                 buf.append(float(value))
                 if len(buf) > self.window:
                     buf.pop(0)
+            if two_lines is not None:
+                self._two_lines.append(1.0 if two_lines else 0.0)
+                if len(self._two_lines) > self.window:
+                    self._two_lines.pop(0)
 
     def reset(self):
         with self._lock:
-            del self._cte[:], self._steer[:], self._found[:], self._bands[:]
+            del (self._cte[:], self._steer[:], self._found[:],
+                 self._bands[:], self._two_lines[:])
 
     @property
     def n(self):
@@ -181,6 +187,14 @@ class RollingStats(object):
                 return 100.0
             tail = self._found[-int(k):]
             return float(100.0 * (1.0 - np.mean(tail)))
+
+    def recent_two_lines_pct(self, k=15):
+        """Ty le % frame trong k frame gan nhat nhan du 2 line 2 ben (Option B)."""
+        with self._lock:
+            if not self._two_lines:
+                return 0.0
+            tail = self._two_lines[-int(k):]
+            return float(100.0 * np.mean(tail))
 
     def cte_history(self):
         with self._lock:
@@ -444,7 +458,11 @@ class LaneTuningEngine(object):
         steer_clipped = abs(self.corner.steer_wanted) > self.corner.steer_limit + 1e-6
         servo_clipped = abs(servo_raw - servo) > 1e-6
 
-        self.stats.push(res.cte, steer, res.found, res.n_bands)
+        has_opt_b = getattr(self.lane, 'last_white_mask', None) is not None
+        two_ok = (bool(getattr(self.lane, 'last_two_lines_ok', False))
+                  if has_opt_b else None)
+        self.stats.push(res.cte, steer, res.found, res.n_bands,
+                        two_lines=two_ok)
         result = {
             'proc': proc, 'lane': res, 'steer': steer, 'throttle': throttle,
             'error': err, 'ramp': ramp, 'mode': mode, 'pid': pid_out,
@@ -691,8 +709,11 @@ def _draw_banner(panel, res, result, fps, armed, driver_kind='dryrun',
                  else 'LAI TAY (DRYRUN - banh khong quay)')
         colour = (255, 160, 60)
     elif not armed:
-        if res.found and result.get('two_lines_ok'):
-            state, colour = 'SAN SANG CHAY (2 LINE OK - bam CHAY)', (80, 235, 80)
+        if result.get('_preview_white') is not None:
+            if res.found and result.get('two_lines_ok'):
+                state, colour = 'SAN SANG CHAY (2 LINE OK - bam CHAY)', (80, 235, 80)
+            else:
+                state, colour = 'CHO DU 2 LINE 2 BEN (chua cho bam CHAY)', (0, 200, 255)
         elif res.found:
             state, colour = 'SAN SANG CHAY (CO VACH - bam CHAY)', (120, 220, 120)
         else:
@@ -1940,16 +1961,33 @@ class LaneTuningUI(object):
             self._log('Xe dang chay roi.')
             return
         summary = self.engine.stats.summary()
-        # Kiem tra tren 20 frame GAN NHAT (~0.7s) thay vi ca cua so 200 frame cu:
+        # 1. Bat buoc camera da tra du >= 5 frame truoc khi cho ARM.
+        if summary is None or summary['n'] < 5:
+            self._log('TU CHOI CHAY: camera chua co du frame on dinh (can >= 5 frame). '
+                      'Cho 1 giay roi bam lai.')
+            self._set_status('TU CHOI CHAY - cho camera on dinh')
+            return
+        # 2. Kiem tra tren 20 frame GAN NHAT (~0.7s) thay vi ca cua so 200 frame cu:
         # khi be xe dat vao giua 2 line, thay vach on la bam CHAY duoc NGAY ma
         # khong bi chan oan boi cac frame nhin san/tuong luc be xe truoc do.
         recent_loss = self.engine.stats.recent_loss_pct(20)
-        if summary is not None and summary['n'] >= 10 and recent_loss > 20.0:
+        if recent_loss > 20.0:
             self._log('TU CHOI CHAY: dang mat vach %.0f%% o 20 frame gan nhat. '
                       'Dat xe vao giua 2 line cho thay vach roi bam lai.'
                       % recent_loss)
             self._set_status('TU CHOI CHAY - dat xe vao 2 line truoc')
             return
+        # 3. AN TOAN OPTION B (3 kenh): bat buoc nhan du 2 LINE 2 BEN (trai + phai)
+        # truoc khi cho phep bam CHAY xuat phat. Khi da chay vao cua gat ma 1 line
+        # tam khuat, xe van chay binh thuong nho kenh tam ao.
+        if getattr(self.engine.lane, 'last_white_mask', None) is not None:
+            two_pct = self.engine.stats.recent_two_lines_pct(15)
+            if two_pct < 60.0:
+                self._log('TU CHOI CHAY: chua nhan du 2 line 2 ben (%.0f%%/15 frame gan nhat). '
+                          'Dat xe vao giua 2 line trang cho den khi hien "2 LINE OK" roi bam lai.'
+                          % two_pct)
+                self._set_status('TU CHOI CHAY - chua du 2 line 2 ben')
+                return
         # Xoa lich su cu truoc khi chay (frame luc be xe) de thong ke luot chay sach
         self.engine.stats.reset()
         try:
@@ -2241,7 +2279,7 @@ class LaneTuningUI(object):
             self._nguon_banner(),
             canh_bao,
             w.HBox([self.btn_open, self.btn_run, self.btn_halt, self.btn_stop]),
-            w.HBox([self.btn_log]),
+            w.HBox([self.btn_log, self.btn_record]),
             w.HBox([self.preview,
                     w.VBox([w.HTML('<b style="font-size:14px">DIEU CHINH</b>'),
                             self._build_simple_panel(), self.btn_close])]),
