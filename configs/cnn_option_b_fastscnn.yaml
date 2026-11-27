@@ -56,8 +56,15 @@ control:
   curve_exit: 0.08
   curve_feedforward: 1.80
   corner_steer_gain: 2.40
+  # Tránh cắt sớm vào trong cua chữ U & tự tăng độ nhạy khi vào vùng nhiều cua liên tiếp
+  corner_enter_delay_s: 0.18
+  curvy_zone_enabled: true
+  curvy_steer_boost: 1.20
+  curvy_lookahead_scale: 0.65
+  curvy_speed_scale: 0.88
   slowdown: 0.20
-  curve_brake: 0.30
+  pre_corner_decel: 0.45
+  curve_brake: 0.00
   corner_hold_s: 0.70
   steer_max: 1.00
   corner_steer_max: 1.00

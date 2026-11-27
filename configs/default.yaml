@@ -205,7 +205,20 @@ control:
   corner_steer_gain: 1.6   # trong chế độ CUA nhân thêm vào lái để bẻ gần hết
   road_turn_steer_gain: 1.15  # hệ số lái thêm khi mép xanh xác nhận hướng cua
   road_turn_release_s: 0.30  # thời gian nhả lái sau cua do mép xanh xác nhận
-  road_entry_steer: 0.0  # mức nhích ra ngoài ở đầu cua, 0 để tắt
+  # Độ giảm tốc trước cua (0..1): hạ ga mượt về v_corner/v_min khi nhìn thấy cua phía trước
+  pre_corner_decel: 0.0
+  # Độ trễ vào cua: giảm ga NGAY nhưng hoãn khuếch đại góc lái mạnh trong vài
+  # phần mười giây đầu để xe đi sâu hơn một nhịp, tránh cắt sớm vào mép trong chữ U.
+  corner_enter_delay_s: 0.0
+  # Tự động nhận diện vùng nhiều cua / chữ U-S liên tiếp: rút ngắn điểm ngắm xa
+  # (tránh cắt dây cung chữ U), nhả lái nhanh khi đảo chiều và tăng độ nhạy lái.
+  curvy_zone_enabled: false
+  curvy_steer_boost: 1.20
+  curvy_lookahead_scale: 0.65
+  curvy_speed_scale: 0.88
+  curvy_window_s: 6.0
+  curvy_turn_count: 2
+  curvy_exit_straight_s: 1.8
   # Giới hạn tốc độ đổi ga: lên từ từ (bánh không trượt), xuống nhanh (thấy cua
   # là bỏ ga ngay).
   throttle_rise_rate: 0.8

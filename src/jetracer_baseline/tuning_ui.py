@@ -34,7 +34,7 @@ import yaml
 from .camera import (LatestFrameGrabber, build_source,
                      format_camera_environment, shading_applied_at_source)
 from .config import load_config
-from .control.corner import CornerController, ENTRY_NUDGE_SECONDS
+from .control.corner import CornerController
 from .control.driver import servo_output_for
 from .control.driver import build_driver
 from .control.pid import PID
@@ -96,7 +96,9 @@ CONTROL_PARAMS = [
     ('control.corner_steer_gain', 'Boi lai khi cua', 1.0, 3.0, 0.05),
     ('control.road_turn_steer_gain', 'Lai cua gat', 1.0, 1.50, 0.05),
     ('control.road_turn_release_s', 'Nha lai ra cua (s)', 0.0, 0.60, 0.05),
-    ('control.road_entry_steer', 'Mo cua ra ngoai', 0.0, 0.15, 0.01),
+    ('control.pre_corner_decel', 'Giam toc truoc cua', 0.0, 1.0, 0.05),
+    ('control.corner_enter_delay_s', 'Tre vao cua (s)', 0.0, 0.50, 0.02),
+    ('control.curvy_steer_boost', 'Nhay vung nhieu cua', 1.0, 1.60, 0.05),
     ('control.steer_max', 'Lai toi da (thang)', 0.10, 1.00, 0.05),
     ('control.corner_steer_max', 'Lai toi da (CUA)', 0.10, 1.00, 0.05),
     ('control.pid.kp', 'PID Kp', 0.0, 2.0, 0.05),
@@ -444,8 +446,8 @@ class LaneTuningEngine(object):
         else:
             res = self.lane.process(proc)
 
-        err = ((1.0 - self.steer_look_w) * res.cte
-               + self.steer_look_w * res.cte_lookahead)
+        look_w = self.corner.effective_lookahead_weight(self.steer_look_w)
+        err = ((1.0 - look_w) * res.cte + look_w * res.cte_lookahead)
         road_turn = getattr(self.lane, 'last_road_turn', 0)
         if not res.found or res.cte_lookahead * road_turn <= 0.0:
             road_turn = 0
@@ -459,7 +461,7 @@ class LaneTuningEngine(object):
             pid_out = self.pid.step(err, dt)
             steer, throttle, mode = self.corner.step(
                 pid_out, res.cte, res.curvature, dt, lane_found=res.found,
-                road_turn=road_turn, entry_turn=getattr(self.lane, 'last_road_entry_turn', 0))
+                road_turn=road_turn, cte_lookahead=res.cte_lookahead)
             ramp = self.soft_start_scale(now)
             throttle *= ramp
 
@@ -490,7 +492,8 @@ class LaneTuningEngine(object):
             result['waiting_for_path'] = self._waiting_for_path
             result['road_turn'] = self.lane.last_road_turn
             result['used_fallback'] = self.lane.last_used_fallback
-            result['entry_return_steer'] = self.corner.entry_return_steer
+            result['curvy_zone'] = self.corner.curvy_zone
+            result['corner_delay_active'] = self.corner.corner_delay_active
         if copy_preview:
             lane_mask = getattr(self.lane, 'last_mask', None)
             if lane_mask is not None:
@@ -549,6 +552,10 @@ class LaneTuningEngine(object):
             else:
                 tag_txt, tag_col = ('BAM TAM VANG', (60, 230, 60)) if res.found else (
                     'CHUA CO TAM DUONG', (60, 60, 255))
+            if result.get('curvy_zone'):
+                tag_txt += ' | VUNG CUA'
+            if result.get('corner_delay_active'):
+                tag_txt += ' | TRE'
             _label(binary, 'OPTION B: ' + tag_txt)
             cv2.circle(binary, (pw - 10, 8), 5, tag_col, -1)
         else:
@@ -864,7 +871,6 @@ class LaneTuningUI(object):
         self._state_lock = threading.Lock()
         self._cv_steer = 0.0
         self._cv_throttle = 0.0
-        self._cv_entry_release = None
         self._cv_started_mono = None
         self._cv_updated_mono = None
         self._camera_stop_reason = None
@@ -1215,14 +1221,6 @@ class LaneTuningUI(object):
             with self._state_lock:
                 self._cv_steer = result['steer']
                 self._cv_throttle = result['throttle']
-                entry_return = result.get('entry_return_steer')
-                if entry_return is None:
-                    self._cv_entry_release = None
-                else:
-                    # Het han theo dong ho cua luong driver, ke ca khi camera cham frame.
-                    previous = getattr(self, '_cv_entry_release', None)
-                    deadline = previous[0] if previous is not None else pipeline_t0 + ENTRY_NUDGE_SECONDS
-                    self._cv_entry_release = (deadline, entry_return)
                 self._cv_started_mono = pipeline_t0
                 self._cv_updated_mono = completed
 
@@ -1655,9 +1653,6 @@ class LaneTuningUI(object):
                         throttle = self._cv_throttle
                         cv_started_mono = self._cv_started_mono
                         cv_updated_mono = getattr(self, '_cv_updated_mono', None)
-                        entry_release = getattr(self, '_cv_entry_release', None)
-                        if entry_release is not None and t0 >= entry_release[0]:
-                            steer = entry_release[1]
                     # Lenh sinh tu frame bat dau truoc moc CHAY la lenh cu.
                     # Gui neutral (0, 0) den khi co completion dau tien cua luot moi.
                     stall_detail = None
@@ -2126,7 +2121,6 @@ class LaneTuningUI(object):
             with self._state_lock:
                 self._cv_started_mono = None
                 self._cv_updated_mono = None
-                self._cv_entry_release = None
             self._ensure_preview_thread()
             self._thread = threading.Thread(target=self._loop, args=(grabber,))
             self._thread.daemon = True
@@ -2201,7 +2195,6 @@ class LaneTuningUI(object):
             with self._state_lock:
                 self._cv_steer = 0.0
                 self._cv_throttle = 0.0
-                self._cv_entry_release = None
                 self._cv_started_mono = None
                 self._cv_updated_mono = None
             if not self._start_run_log(MODE_AUTO):
@@ -2310,19 +2303,23 @@ class LaneTuningUI(object):
             'control.curve_feedforward': round(0.60 + 1.60 * p, 3),
         }
 
-    # --- anh xa cho num PHANH TRUOC CUA -----------------------------------
-    # 0.00 = gan nhu khong phanh (giu toc do vao cua)
-    # 1.00 = phanh manh khi thay cua
+    # --- anh xa cho num GIAM TOC TRUOC CUA --------------------------------
+    # 0.00 = giu ga thang cho toi khi vao cua   |   1.00 = giam toc manh ngay khi thay cua
     @staticmethod
-    def _phanh_to_cfg(p):
+    def _giam_toc_to_cfg(p):
+        p = max(0.0, min(1.0, float(p)))
         return {
-            'control.curve_brake': round(0.70 * p, 3),   # theo do cong (don dau)
-            'control.slowdown': round(0.05 + 0.35 * p, 3),  # theo cte (phan ung)
+            'control.pre_corner_decel': round(p, 3),
+            'control.curve_brake': 0.0,
+            'control.slowdown': round(0.05 + 0.30 * p, 3),
         }
 
     @staticmethod
-    def _cfg_to_phanh(curve_brake):
-        return max(0.0, min(1.0, float(curve_brake) / 0.70))
+    def _cfg_to_giam_toc(pre_corner_decel, curve_brake=0.0):
+        val = float(pre_corner_decel)
+        if val <= 0.0 and float(curve_brake) > 0.0:
+            val = float(curve_brake) / 0.70
+        return max(0.0, min(1.0, val))
 
     @staticmethod
     def _cfg_to_cua_som(curve_enter):
@@ -2356,20 +2353,25 @@ class LaneTuningUI(object):
         nha_lai = w.FloatSlider(
             value=float(g('control.road_turn_release_s', 0.0)),
             min=0.0, max=0.60, step=0.05, description='NHA LAI RA CUA (s)', **L)
-        mo_cua = w.FloatSlider(
-            value=float(g('control.road_entry_steer', 0.0)),
-            min=0.0, max=0.15, step=0.01, description='MO CUA RA NGOAI', **L)
-        phanh = w.FloatSlider(
-            value=self._cfg_to_phanh(g('control.curve_brake', 0.30)),
+        tre_cua = w.FloatSlider(
+            value=float(g('control.corner_enter_delay_s', 0.0)),
+            min=0.0, max=0.50, step=0.02, description='TRE VAO CUA (s)', **L)
+        nhay_vung_cua = w.FloatSlider(
+            value=float(g('control.curvy_steer_boost', 1.20)),
+            min=1.0, max=1.60, step=0.05, description='NHAY VUNG CUA', **L)
+        giam_toc = w.FloatSlider(
+            value=self._cfg_to_giam_toc(g('control.pre_corner_decel', 0.0),
+                                        g('control.curve_brake', 0.0)),
             min=0.0, max=1.0, step=0.05,
-            description='PHANH TRUOC CUA', **L)
+            description='GIAM TOC TRUOC CUA', **L)
         goc_lai = w.FloatSlider(
             value=float(g('control.driver.steering_output_max', 0.40)),
             min=0.30, max=1.00, step=0.05,
             description='GOC LAI TOI DA', **L)
         # Moi num mot dong so RIENG ngay duoi. Doc dam, luon hien du cot hep.
         notes = dict((k, w.HTML()) for k in
-                     ('toc_do', 'toc_cua', 'cua_som', 'lai_cua_gat', 'nha_lai', 'mo_cua', 'phanh', 'goc_lai'))
+                     ('toc_do', 'toc_cua', 'cua_som', 'lai_cua_gat', 'nha_lai',
+                      'tre_cua', 'nhay_vung_cua', 'giam_toc', 'goc_lai'))
         info = w.HTML()
 
         def _n(html):
@@ -2402,11 +2404,18 @@ class LaneTuningUI(object):
                 'nhan lai <b>%.2fx</b> khi mep xanh va diem ngam cung huong'
                 % gp('control.road_turn_steer_gain', 1.0))
             notes['nha_lai'].value = _n('thoi gian nha lai dan sau cua gat')
-            notes['mo_cua'].value = _n('nhich ra ngoai toi da 0.10 s khi doc duoc cua tu xa va con cho')
-            notes['phanh'].value = _n(
-                'phanh theo do cong <b>%.2f</b> &nbsp;|&nbsp; theo do lech '
-                '<b>%.2f</b>' % (gp('control.curve_brake', 0),
-                                 gp('control.slowdown', 0)))
+            notes['tre_cua'].value = _n(
+                'hoan khuếch dai lai <b>%.2f s</b> khi bat dau vao cua (giam toc ngay, tranh cat som chu U)'
+                % float(gp('control.corner_enter_delay_s', 0.0)))
+            notes['nhay_vung_cua'].value = _n(
+                'vung nhieu cua U/S (%s): nhan lai <b>%.2fx</b>, keo ngam gan <b>%.0f%%</b>'
+                % ('BAT' if gp('control.curvy_zone_enabled', False) else 'TAT',
+                   float(gp('control.curvy_steer_boost', 1.20)),
+                   100.0 * float(gp('control.curvy_lookahead_scale', 0.65))))
+            notes['giam_toc'].value = _n(
+                'giam toc truoc cua <b>%.0f%%</b> &nbsp;|&nbsp; ha ga theo lech '
+                '<b>%.2f</b>' % (100.0 * float(gp('control.pre_corner_decel', 0.0)),
+                                 float(gp('control.slowdown', 0.0))))
             tran_sv = float(gp('control.driver.steering_output_max', 0))
             notes['goc_lai'].value = _n(
                 'tran servo = <b>%.2f</b> &nbsp; (<b>%.0f%%</b> tam lai)'
@@ -2442,8 +2451,8 @@ class LaneTuningUI(object):
             for k, val in self._cua_som_to_cfg(v).items():
                 self.engine.set_param(k, val)
 
-        def set_phanh(v):
-            for k, val in self._phanh_to_cfg(v).items():
+        def set_giam_toc(v):
+            for k, val in self._giam_toc_to_cfg(v).items():
                 self.engine.set_param(k, val)
 
         def set_goc_lai(v):
@@ -2452,15 +2461,17 @@ class LaneTuningUI(object):
             self.engine.set_param('control.driver.steering_output_min', -v)
 
         for sl, fn in ((toc_do, set_toc_do), (toc_cua, set_toc_cua),
-                       (cua_som, set_cua_som), (phanh, set_phanh),
+                       (cua_som, set_cua_som), (giam_toc, set_giam_toc),
                        (goc_lai, set_goc_lai)):
             sl.observe(mk(fn), names='value')
         lai_cua_gat.observe(mk(lambda v: self.engine.set_param(
             'control.road_turn_steer_gain', v), update_speed_cap=False), names='value')
         nha_lai.observe(mk(lambda v: self.engine.set_param(
             'control.road_turn_release_s', v), update_speed_cap=False), names='value')
-        mo_cua.observe(mk(lambda v: self.engine.set_param(
-            'control.road_entry_steer', v), update_speed_cap=False), names='value')
+        tre_cua.observe(mk(lambda v: self.engine.set_param(
+            'control.corner_enter_delay_s', v), update_speed_cap=False), names='value')
+        nhay_vung_cua.observe(mk(lambda v: self.engine.set_param(
+            'control.curvy_steer_boost', v), update_speed_cap=False), names='value')
         _refresh()
 
         huong_dan = w.HTML(
@@ -2469,12 +2480,13 @@ class LaneTuningUI(object):
             '<b>TOC DO thang</b> &mdash; ga o doan thang. Diem thoi gian an o day.<br>'
             '<b>TOC DO trong cua</b> &mdash; ga khi dang cua. <b>Giam</b> neu xe '
             'vang ra NGOAI cua &mdash; chay cham thi ban kinh cua nho lai.<br>'
-            '<b>CUA SOM</b> &mdash; xong vao cua som va manh den dau. <b>Tang</b> '
-            'neu xe cua muon, cat vao phia TRONG cua. <b>Giam</b> neu doan thang '
-            'xe luon zigzag.<br>'
-            '<b>PHANH TRUOC CUA</b> &mdash; bo ga ngay khi NHIN THAY cua, '
-            'truoc luc xe lech. <b>Tang</b> neu xe vao cua con nhanh qua. '
-            '<b>Giam</b> neu xe phanh oan o doan thang.<br>'
+            '<b>CUA SOM</b> &mdash; xong vao cua som va manh den dau.<br>'
+            '<b>TRE VAO CUA</b> &mdash; hoan danh het lai them mot nhip khi moi vao cua '
+            'de xe khong cat som vao mep TRONG chu U.<br>'
+            '<b>NHAY VUNG CUA</b> &mdash; tu kich hoat khi vao doan nhieu cua U/S lien tiep: '
+            'ngam gan hon, dao chieu nhanh va lai nhay hon.<br>'
+            '<b>GIAM TOC TRUOC CUA</b> &mdash; muc ha ga muot tu ga thang ve ga cua/san '
+            'ngay khi thay cua phia truoc. <b>Tang</b> neu vao cua con nhanh qua.<br>'
             '<b>GOC LAI TOI DA</b> &mdash; banh be duoc toi dau. <b>Tang</b> neu '
             'cua khong noi, chay thang ra ngoai lane.<br>'
             '<span style="color:#b00020"><b>CANH BAO:</b> GOC LAI TOI DA la gioi '
@@ -2485,8 +2497,9 @@ class LaneTuningUI(object):
                        cua_som, notes['cua_som'],
                        lai_cua_gat, notes['lai_cua_gat'],
                        nha_lai, notes['nha_lai'],
-                       mo_cua, notes['mo_cua'],
-                       phanh, notes['phanh'],
+                       tre_cua, notes['tre_cua'],
+                       nhay_vung_cua, notes['nhay_vung_cua'],
+                       giam_toc, notes['giam_toc'],
                        goc_lai, notes['goc_lai'],
                        info, huong_dan])
 

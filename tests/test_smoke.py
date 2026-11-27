@@ -1141,7 +1141,7 @@ def test_disarm_cannot_be_followed_by_stale_driver_set():
     assert ui._armed is False and ui.mode == MODE_STOP
 
 
-def test_auto_control_checks_frame_age_and_entry_nudge_expiry():
+def test_auto_control_ignores_pre_run_frame():
     commands = []
 
     class Driver(object):
@@ -1171,15 +1171,6 @@ def test_auto_control_checks_frame_age_and_entry_nudge_expiry():
 
     ui._control_loop()
     assert commands == [(0.0, 0.0)], commands
-
-    now = time.monotonic()
-    ui._run_started_mono = now - 1.0
-    ui._cv_started_mono = now - 0.12
-    ui._cv_steer = -0.08
-    ui._cv_entry_release = (now - 0.02, 0.31)
-    ui._control_stop.clear()
-    ui._control_loop()
-    assert commands[-1] == (0.31, 0.9), commands
 
 
 def test_auto_control_disarms_when_pipeline_command_is_stale():
@@ -1499,33 +1490,85 @@ def test_confirmed_road_turn_boosts_steering_without_increasing_limits():
     assert ctrl.step(0.9, 0.0, 0.0, 1.0, road_turn=1)[0] == 0.60
 
 
-def test_road_entry_nudge_runs_once_and_yields_to_the_confirmed_turn():
-    ctrl = CornerController(_corner_cfg(control__road_entry_steer=0.08))
-    dt = 1.0 / 30.0
-    for direction in (-1, 1):
-        ctrl.reset()
-        for _ in range(10):
-            ctrl.step(0.0, 0.0, 0.0, dt)
-        for _ in range(3):
-            steer, throttle, _mode = ctrl.step(direction * 0.25, 0.0, 0.0, dt,
-                                               entry_turn=direction)
-            assert steer == -direction * 0.08 and throttle == 0.12
-            assert ctrl.entry_return_steer == direction * 0.25
-        for _ in range(5):
-            steer, _, _ = ctrl.step(direction * 0.25, 0.0, 0.0, dt, entry_turn=direction)
-            assert steer * direction > 0 and ctrl.entry_return_steer is None
-
+def test_corner_enter_delay_curvy_zone_and_pre_corner_decel():
+    """Do tre vao cua chong cat som, vung nhieu cua U/S tang nhay, giam toc truoc cua muot."""
+    # 1. Do tre vao cua: giam ga NGAY nhung tang dan he so lai cua; bo qua neu lech manh
+    cfg_d = _corner_cfg(
+        control__corner_enter_delay_s=0.20,
+        control__curve_enter=0.12,
+        control__curve_exit=0.08,
+        control__curve_feedforward=1.2,
+        control__corner_steer_gain=2.0,
+        control__steer_max=1.0,
+        control__corner_steer_max=1.0,
+        control__throttle_fall_rate=10.0,
+    )
+    ctrl_d = CornerController(cfg_d)
     for _ in range(10):
-        ctrl.step(0.0, 0.0, 0.0, dt)
-    assert ctrl.step(0.25, 0.0, 0.0, dt, entry_turn=1)[0] == -0.08
-    assert ctrl.step(0.25, 0.0, 0.0, dt, road_turn=1)[0] > 0.0
-    assert ctrl.entry_return_steer is None
+        ctrl_d.step(0.0, 0.0, 0.0, 0.1)
+    s_early, t_early, m_early = ctrl_d.step(0.15, 0.0, 0.20, 0.04)
+    assert m_early == CORNER and ctrl_d.corner_delay_active
+    assert t_early < 0.25, 'phai giam ga ngay du dang tre lai: %.3f' % t_early
+    # Sau khi het thoi gian tre -> lai cua manh hon ro ret
+    for _ in range(5):
+        s_full, _, _ = ctrl_d.step(0.15, 0.0, 0.20, 0.04)
+    assert not ctrl_d.corner_delay_active
+    assert s_full > s_early * 1.45, 'sau tre lai phai tang: %.3f vs %.3f' % (s_early, s_full)
 
-    ctrl.reset()
-    for _ in range(10):
-        ctrl.step(0.0, 0.0, 0.0, dt)
-    assert ctrl.step(0.25, 0.0, 0.0, 0.09, entry_turn=1)[0] == 0.25
-    assert ctrl.step(0.25, 0.0, 0.0, dt, entry_turn=1)[0] == 0.25
+    # Bo qua do tre ngay khi xe da lech sat bien (|cte| >= 0.35)
+    ctrl_d.reset()
+    s_urg, _, _ = ctrl_d.step(0.15, 0.40, 0.20, 0.04)
+    assert not ctrl_d.corner_delay_active and s_urg > s_early * 1.45
+
+    # 2. Vung nhieu cua (curvy_zone): kich hoat khi dao chieu trai<->phai (chu S/U),
+    #    keo trong so ngam gan hon, tang do nhay lai cua, va tat sau khi chay thang du lau.
+    cfg_u = _corner_cfg(
+        control__curvy_zone_enabled=True,
+        control__curvy_steer_boost=1.25,
+        control__curvy_lookahead_scale=0.65,
+        control__curvy_speed_scale=0.85,
+        control__curvy_exit_straight_s=1.0,
+        control__curve_enter=0.15,
+        control__curve_exit=0.08,
+        control__corner_steer_gain=1.5,
+        control__steer_max=1.0,
+        control__corner_steer_max=1.0,
+    )
+    ctrl_u = CornerController(cfg_u)
+    assert not ctrl_u.curvy_zone
+    assert abs(ctrl_u.effective_lookahead_weight(0.70) - 0.70) < 1e-6
+    s_first, _, _ = ctrl_u.step(0.20, 0.0, 0.25, 0.10)   # cua phai #1
+    assert not ctrl_u.curvy_zone
+    s_rev, _, _ = ctrl_u.step(-0.20, 0.0, -0.25, 0.10)   # dao chieu sang trai #2 -> vao vung cua!
+    assert ctrl_u.curvy_zone
+    assert abs(ctrl_u.effective_lookahead_weight(0.70) - 0.70 * 0.65) < 1e-6
+    assert abs(s_rev) > abs(s_first) * 1.15
+    # Chay thang lien tuc >= 1.0s -> tu thoat vung cua
+    for _ in range(12):
+        ctrl_u.step(0.0, 0.0, 0.0, 0.10)
+    assert not ctrl_u.curvy_zone
+
+    # 3. Do giam toc truoc cua (pre_corner_decel): giu ga thang khi duong thang,
+    #    nhung ha ga muot ngay khi nhin thay cua o diem ngam / do cong phia truoc.
+    cfg_p0 = _corner_cfg(control__pre_corner_decel=0.0, control__curve_brake=0.0,
+                         control__v_straight=0.30, control__v_corner=0.14,
+                         control__v_min=0.10, control__throttle_rise_rate=5.0,
+                         control__throttle_fall_rate=5.0)
+    cfg_p1 = _corner_cfg(control__pre_corner_decel=0.80, control__curve_brake=0.0,
+                         control__v_straight=0.30, control__v_corner=0.14,
+                         control__v_min=0.10, control__throttle_rise_rate=5.0,
+                         control__throttle_fall_rate=5.0)
+    c0, c1 = CornerController(cfg_p0), CornerController(cfg_p1)
+    for _ in range(5):
+        _, t0_str, _ = c0.step(0.0, 0.0, 0.0, 0.2, cte_lookahead=0.0)
+        _, t1_str, _ = c1.step(0.0, 0.0, 0.0, 0.2, cte_lookahead=0.0)
+    assert abs(t0_str - 0.30) < 1e-6 and abs(t1_str - 0.30) < 1e-6
+    # Nhin thay cua phia truoc (chua vao CORNER, nhung curv=0.18 & lookahead=0.35)
+    for _ in range(5):
+        _, t0_app, m0 = c0.step(0.0, 0.0, 0.18, 0.2, cte_lookahead=0.35)
+        _, t1_app, m1 = c1.step(0.0, 0.0, 0.18, 0.2, cte_lookahead=0.35)
+    assert m0 == STRAIGHT and m1 == STRAIGHT
+    assert t1_app < t0_app - 0.05 and t1_app >= 0.10, (t0_app, t1_app)
 
 
 def test_confirmed_turn_releases_steering_gradually_and_cancels_on_direction_change():

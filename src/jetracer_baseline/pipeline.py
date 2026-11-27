@@ -376,8 +376,9 @@ class Runner(object):
                 # Tron lech tai muc xe voi lech tai diem ngam xa. Chi dung
                 # cte thi xe luon sua MUON o cua: den luc CTE tang du de PID
                 # phan ung thi xe da an vao mep lane roi.
-                err = ((1.0 - self.steer_look_w) * lane_res.cte
-                       + self.steer_look_w * lane_res.cte_lookahead)
+                look_w = self.corner.effective_lookahead_weight(self.steer_look_w)
+                err = ((1.0 - look_w) * lane_res.cte
+                       + look_w * lane_res.cte_lookahead)
                 pid_out = self.pid.step(err, dt)
                 road_turn = getattr(self.lane, 'last_road_turn', 0)
                 if not lane_res.found or lane_res.cte_lookahead * road_turn <= 0.0:
@@ -385,7 +386,7 @@ class Runner(object):
                 steer, throttle, drive_mode = self.corner.step(
                     pid_out, lane_res.cte, lane_res.curvature, dt,
                     lane_found=lane_res.found, road_turn=road_turn,
-                    entry_turn=getattr(self.lane, 'last_road_entry_turn', 0))
+                    cte_lookahead=lane_res.cte_lookahead)
 
                 if cmd.steer_override is not None:
                     steer = max(-self.steer_max,
