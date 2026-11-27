@@ -549,7 +549,9 @@ class LaneTuningEngine(object):
             cv2.line(overlay, (0, y0), (pw, y0), (0, 255, 255), 1)
             cv2.line(binary, (0, y0), (pw, y0), (70, 70, 70), 1)
             _label(overlay, 'CAMERA + 2 LINE (TIM) + TAM (VANG)')
-            if result.get('two_lines_ok'):
+            if result.get('used_fallback'):
+                tag_txt, tag_col = 'DANG DUNG TAM DU PHONG', (0, 220, 255)
+            elif result.get('two_lines_ok'):
                 tag_txt, tag_col = '2 LINE: DU TRAI+PHAI', (60, 230, 60)
             elif result.get('left_line') or result.get('right_line'):
                 side = 'TRAI' if result.get('left_line') else 'PHAI'

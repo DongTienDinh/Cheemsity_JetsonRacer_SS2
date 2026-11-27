@@ -1981,6 +1981,77 @@ def test_lane_cnn_supports_option_b_3channel_and_road_fallback():
     assert not det.last_two_lines_ok
 
 
+def test_lane_cnn_recovery_prioritizes_visible_road_edge():
+    from jetracer_baseline.perception.lane_cnn import (
+        CnnLaneDetector, PROC_H, PROC_W, SEG_H, SEG_W)
+
+    cfg = load_config(CONFIG, [os.path.join(ROOT, 'configs', 'cnn_option_b_fast.yaml')])
+    cfg.set('lane.cnn.engine', '')
+    det = CnnLaneDetector(cfg)
+    assert det.single_line_fallback
+    # Phep chieu don gian de tao vach cheo va vet phan chieu trong BEV.
+    det._M_seg = np.diag([PROC_W / float(SEG_W), PROC_H / float(SEG_H), 1.0])
+    det._build_bev_lut()
+    frame = np.zeros((PROC_H, PROC_W, 3), dtype=np.uint8)
+
+    class FakeEngine(object):
+        def infer(self, _x):
+            return {'seg': self.seg, 'reg': self.reg}
+
+    det.engine = FakeEngine()
+    one_boundary = np.full((3, SEG_H, SEG_W), -5.0, dtype=np.float32)
+    for y in range(SEG_H):
+        edge = int(round(18 + (SEG_H - 1 - y) * 0.47))
+        one_boundary[0, y, edge + 2:] = 5.0
+        one_boundary[1, y, edge - 1:edge + 2] = 5.0
+
+    def run(seg, look, preview=False):
+        det.reset()
+        det.engine.seg = seg
+        det.engine.reg = np.array([-0.32, look, 0.0], dtype=np.float32)
+        return det.process(frame, need_aux=preview, compute_bev=preview)
+
+    right = run(one_boundary, 0.33)
+    assert right.found and right.cte_lookahead > 0.20 and det.last_used_fallback
+    no_white = one_boundary.copy()
+    no_white[1] = -5.0
+    assert abs(run(no_white, 0.33).cte_lookahead - right.cte_lookahead) < 1e-6
+
+    glare = no_white.copy()
+    glare[1, 8:58, 4:8] = 5.0  # Vach gia ngoai mat duong.
+    glare[1, 16:48, 84:87] = 5.0
+    glare[0, 16:48, 84:87] = -5.0  # Phan chieu lam thung mask Ch0.
+    assert abs(run(glare, 0.33).cte_lookahead - right.cte_lookahead) < 1e-6
+
+    left = run(one_boundary[:, :, ::-1], -0.33, preview=True)
+    assert left.found and left.cte_lookahead < -0.20 and det.last_used_fallback
+    assert left.debug.any() and det.last_mask.any() and not det.last_center_mask.any()
+
+    wrong_center = one_boundary.copy()
+    wrong_center[2, :, 38:42] = 5.0
+    corrected = run(wrong_center, 0.33)
+    assert corrected.found and corrected.cte_lookahead > 0.20 and det.last_used_fallback
+
+    healthy = one_boundary.copy()
+    healthy[2, :, 63:66] = 5.0
+    assert run(healthy, 0.0).found and not det.last_used_fallback
+
+    # Neu mep doi dien cat dai offset, mot vach co that sat mep van ho tro duoc.
+    white_assists = one_boundary.copy()
+    white_assists[0, :, 94:] = -5.0
+    assert run(white_assists, 0.33).found and det.last_used_fallback
+    two_boundaries = white_assists.copy()
+    two_boundaries[1, :, 94:97] = 5.0
+    assert not run(two_boundaries, 0.33).found
+    white_assists[1] = -5.0
+    assert not run(white_assists, 0.33).found
+
+    # Khi Ch0 phu kin tam nhin, vien anh khong duoc tinh la mep lan.
+    glare[0] = 5.0
+    assert not run(glare, 0.33).found
+    assert not run(one_boundary, -0.33).found and not det.last_used_fallback
+
+
 def test_speed_track_ui_option_b_panel_and_recent_run_gate():
     """Giao dien Speed Track hien 2 line Option B va cho bam CHAY ngay khi dat vao 2 line."""
     from jetracer_baseline.perception.lane_cnn import CnnLaneDetector, SEG_H, SEG_W

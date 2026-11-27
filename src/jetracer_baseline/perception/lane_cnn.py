@@ -358,9 +358,10 @@ class CnnLaneDetector(object):
         # bao found=False de FSM ha ga / roi ve CV.
         self.reg_disagree = float(c('lane.cnn.reg_disagree', 0.35))
         self.check_reg = bool(c('lane.cnn.check_reg', True))
-        # Option B (3 kenh): mac dinh False -> chi bam DUNG kenh phan vang (Ch2 centerline)
-        # do model du doan. Bat True chi khi muon du phong suy tam tu Ch0/Ch1.
+        # Cac che do du phong Option B tu mat duong Ch0 va bien trang Ch1.
         self.road_fallback = bool(c('lane.cnn.road_fallback', False))
+        self.single_line_fallback = bool(c('lane.cnn.single_line_fallback', False))
+        self.single_line_offset_px = float(c('lane.cnn.single_line_offset_px', 108.0))
 
     def _reset_state(self):
         self._cte = 0.0
@@ -391,6 +392,12 @@ class CnnLaneDetector(object):
         cho tung pixel 64x128. Tuong duong toan hoc voi warpPerspective(INTER_NEAREST)
         nhung khi chay chi dung ~300 pixel active thay vi 76,800 pixel.
         """
+        valid = cv2.warpPerspective(np.ones((SEG_H, SEG_W), np.uint8), self._M_seg,
+                                    (PROC_W, PROC_H), flags=cv2.INTER_NEAREST)
+        self._edge_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        # Bo vien cua anh BEV va bien do camera cat khoi cac moc tinh khoang cach.
+        self._bev_visible = cv2.erode(valid, self._edge_kernel, borderType=cv2.BORDER_CONSTANT,
+                                      borderValue=0) > 0
         m_inv = np.linalg.inv(self._M_seg)
         yy, xx = np.mgrid[0:PROC_H, 0:PROC_W]
         denom = m_inv[2, 0] * xx + m_inv[2, 1] * yy + m_inv[2, 2]
@@ -665,14 +672,122 @@ class CnnLaneDetector(object):
                 fb[y, x0:x1] = 255
         return fb
 
+    def _ego_road_bev(self, road_logits):
+        road = cv2.warpPerspective((road_logits > 0.0).astype(np.uint8), self._M_seg,
+                                   (PROC_W, PROC_H), flags=cv2.INTER_NEAREST)
+        _, road_ids = cv2.connectedComponents(road, connectivity=8)
+        half = PROC_W // 2
+        near = road_ids[-30:, half - 12:half + 12]
+        road_counts = np.bincount(near.ravel())
+        road_counts[0] = 0
+        if road_counts.max() < 40:
+            return None
+        ego_road = (road_ids == road_counts.argmax()).astype(np.uint8)
+        # Lap lo trong road truoc khi tim mep de loai vet trang do phan chieu.
+        outlines = cv2.findContours(ego_road, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
+        cv2.drawContours(ego_road, outlines, -1, 1, cv2.FILLED)
+        return ego_road
+
+    def _white_road_edge_bev(self, white_logits, ego_road):
+        white = cv2.warpPerspective((white_logits > 0.405465).astype(np.uint8), self._M_seg,
+                                    (PROC_W, PROC_H), flags=cv2.INTER_NEAREST)  # sigmoid > 0.60
+        rim = cv2.morphologyEx(ego_road, cv2.MORPH_GRADIENT, self._edge_kernel) > 0
+        rim &= self._bev_visible
+        _, line_ids, stats, _ = cv2.connectedComponentsWithStats(white, connectivity=8)
+        touching = np.bincount(line_ids[rim], minlength=len(stats))
+        area = stats[:, cv2.CC_STAT_AREA]
+        span = np.maximum(stats[:, cv2.CC_STAT_WIDTH], stats[:, cv2.CC_STAT_HEIGHT])
+        supported = (area >= 25) & (span >= 24) & (touching >= 20) & (touching >= 0.18 * area)
+        lines = np.flatnonzero(supported[1:]) + 1
+        if len(lines) != 1:
+            return None
+        return (line_ids == lines[0]) & rim
+
+    def _fit_inward_offset(self, ego_road, outside):
+        # Duong cach deu o phia trong mat duong, ke ca khi mep cua gan nam ngang.
+        distance = cv2.distanceTransform((~outside).astype(np.uint8), cv2.DIST_L2, 5)
+        center = (ego_road > 0) & (np.abs(distance - self.single_line_offset_px) <= 4.0)
+        _, center_ids, stats, _ = cv2.connectedComponentsWithStats(center.astype(np.uint8), connectivity=8)
+        height = stats[:, cv2.CC_STAT_HEIGHT]
+        bottom = stats[:, cv2.CC_STAT_TOP] + height
+        supported = (stats[:, cv2.CC_STAT_AREA] >= 70) & (height >= 48) & (bottom >= 0.65 * PROC_H)
+        half = PROC_W // 2
+        best_id, best_dist = None, 75 ** 2
+        for idx in np.flatnonzero(supported[1:]) + 1:
+            ys, xs = np.where(center_ids == idx)
+            dist = np.min((xs - half) ** 2 + (ys - PROC_H) ** 2)
+            if dist < best_dist:
+                best_id, best_dist = idx, dist
+        if best_id is None:
+            return None
+
+        bev = (center_ids == best_id).astype(np.uint8) * 255
+        ts, xs, npix = [], [], 0
+        for t, band in zip(self._band_ts, np.array_split(bev[::-1], N_BANDS)):
+            x, n = self._band_centre(band)
+            if x is not None:
+                ts.append(t)
+                xs.append(x)
+                npix += n
+        if len(ts) < max(3, self.min_bands):
+            return None
+        co = self._fit_poly_fast(np.asarray(ts), np.asarray(xs))
+        return co, ts[-1], len(ts), npix, bev
+
+    def _fit_values(self, co, t_max):
+        half = PROC_W / 2.0
+        t_look = min(self.lookahead, t_max)
+        cte = (co[2] - half) / half
+        look = ((co[0] * t_look + co[1]) * t_look + co[2] - half) / half
+        curvature = co[0] * t_max * t_max / half
+        return tuple(float(np.clip(v, -1.0, 1.0)) for v in (cte, look, curvature))
+
+    def _fit_recovery(self, ego_road, edge, reg_look):
+        if edge is None:
+            return None
+        fit = self._fit_inward_offset(ego_road, edge)
+        if fit is None:
+            return None
+        co, t_max = fit[:2]
+        t_look = min(self.lookahead, t_max)
+        x = int(round(float(np.polyval(co, t_look))))
+        y = int(np.clip(round((1.0 - t_look) * PROC_H), 0, PROC_H - 1))
+        if not (0 <= x < PROC_W and ego_road[y, x]):
+            return None
+        values = self._fit_values(co, t_max)
+        if values[1] * reg_look <= 0.0 or abs(values[1] - reg_look) > self.reg_disagree:
+            return None
+        return fit, values
+
+    def _recover_single_line(self, seg3, reg, raw, cte_disagree):
+        if reg is None or len(reg) < 2:
+            return None
+        reg_look = float(reg[1])
+        if not np.isfinite(reg_look) or abs(reg_look) < 0.20:
+            return None
+        look_disagree = (raw is not None and self.check_reg and raw[1] * reg_look <= 0.0
+                         and abs(raw[1] - reg_look) > self.reg_disagree)
+        if raw is not None and not (cte_disagree or look_disagree):
+            return None
+        ego_road = self._ego_road_bev(seg3[0])
+        if ego_road is None:
+            return None
+        outside = self._bev_visible & (ego_road == 0)
+        if np.count_nonzero(outside) >= 70:
+            recovery = self._fit_recovery(ego_road, outside, reg_look)
+            if recovery is not None:
+                return recovery
+        # Chi tham khao phan cua vach trang thuc su nam sat mep Ch0.
+        white_edge = self._white_road_edge_bev(seg3[1], ego_road)
+        return self._fit_recovery(ego_road, white_edge, reg_look)
+
     # ------------------------------------------------------------------ chay
     def process(self, frame_bgr, need_aux=True, compute_bev=False):
         """Suy dien va fit duong tam.
 
-        - `need_aux=False`: duong nong khi xe dang chay TU DONG (chi dung kenh
-          Ch2 centerline, bo qua chuyen uint8 Ch0/Ch1 va _check_two_lines).
-        - `compute_bev=False`: bo qua cv2.warpPerspective(320x240) nho bang
-          tra cuu LUT 64x128; chi bat True o dung tick ve preview (1-5 Hz).
+        - `need_aux=False`: khi Ch2 du tin cay, bo qua chuyen uint8 Ch0/Ch1
+          va _check_two_lines tren duong nong.
+        - `compute_bev=False`: chi chieu BEV khi can suy lai tu mat duong.
         """
         if self.engine is None:
             raise RuntimeError(
@@ -687,6 +802,7 @@ class CnnLaneDetector(object):
 
         seg, reg = self._pick_outputs(outs)
         self.last_used_fallback = False
+        seg3 = None
         # Nguong 0 tren logits == sigmoid > 0.5. Model co y khong co Sigmoid.
         if seg.size == 3 * SEG_H * SEG_W:
             seg3 = seg.reshape(3, SEG_H, SEG_W)
@@ -755,29 +871,33 @@ class CnnLaneDetector(object):
                 co, t_max, n_bands, npix = self._mask_to_fit_lut(seg1)
                 self.last_bev = None
 
-        if co is None:
+        raw = self._fit_values(co, t_max) if co is not None else None
+        cte_disagree = (raw is not None and self.check_reg and reg is not None
+                        and len(reg) >= 1 and abs(float(reg[0]) - raw[0]) > self.reg_disagree)
+        if cte_disagree:
+            self.n_disagree += 1
+
+        if self.single_line_fallback and seg3 is not None:
+            recovery = self._recover_single_line(seg3, reg, raw, cte_disagree)
+            if recovery is not None:
+                (co, _, n_bands, npix, fb_bev), raw = recovery
+                cte_disagree = False
+                if not self.last_used_fallback:
+                    self.n_fallback += 1
+                self.last_used_fallback = True
+                if need_aux or compute_bev:
+                    self.last_mask = cv2.warpPerspective(
+                        fb_bev, self._M_seg, (SEG_W, SEG_H),
+                        flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP)
+                if compute_bev:
+                    self.last_bev = fb_bev
+
+        if raw is None or cte_disagree:
             self.last_total_ms = (time.perf_counter() - t0) * 1000.0
             return LaneResult(False, self._cte, self._curv, npix, self.last_bev,
                               cte_lookahead=self._look, n_bands=n_bands)
 
-        half = PROC_W / 2.0
-        t_look = min(self.lookahead, t_max)
-        raw_cte = float(np.clip((co[2] - half) / half, -1.0, 1.0))
-        raw_look = float(np.clip(
-            (co[0] * t_look * t_look + co[1] * t_look + co[2] - half) / half,
-            -1.0, 1.0))
-        raw_curv = float(np.clip(co[0] * t_max * t_max / half, -1.0, 1.0))
-
-        # Kiem tra cheo hai head. Chung duoc train tren cung nhan nhung di qua
-        # hai duong khac nhau trong mang, nen lech nhieu = model dang doan bua.
-        if self.check_reg and reg is not None and len(reg) >= 1:
-            if abs(float(reg[0]) - raw_cte) > self.reg_disagree:
-                self.n_disagree += 1
-                self.last_total_ms = (time.perf_counter() - t0) * 1000.0
-                return LaneResult(False, self._cte, self._curv, npix,
-                                  self.last_bev, cte_lookahead=self._look,
-                                  n_bands=n_bands)
-
+        raw_cte, raw_look, raw_curv = raw
         if not self._init:
             self._cte, self._look, self._curv = raw_cte, raw_look, raw_curv
             self._init = True
