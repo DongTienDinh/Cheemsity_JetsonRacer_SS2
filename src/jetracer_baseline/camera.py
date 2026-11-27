@@ -209,6 +209,9 @@ class CSISource(FrameSource):
         self.last_error = None
         self._needs_warmup = True
         self.cap = None
+        self._capture_lock = threading.Lock()
+        self._closed = False
+        self._capture_ops = 0
         self._lease = CameraLease()
 
         self._lease.acquire()
@@ -225,14 +228,48 @@ class CSISource(FrameSource):
             raise
 
     def _open_csi_capture(self):
-        if self.cap is not None:
+        return self._replace_capture('csi-gstreamer', self.pipeline, cv2.CAP_GSTREAMER)
+
+    def _replace_capture(self, backend, target, api=None):
+        with self._capture_lock:
+            if self._closed:
+                return False
+            old, self.cap = self.cap, None
+            self._capture_ops += 1
+        cap = None
+        try:
+            if old is not None:
+                try:
+                    old.release()
+                except Exception:
+                    pass
+            if self._closed:
+                return False
+            cap = cv2.VideoCapture(target) if api is None else cv2.VideoCapture(target, api)
+            opened = cap.isOpened()
+            if opened and api is None:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+                cap.set(cv2.CAP_PROP_FPS, self.fps)
+            with self._capture_lock:
+                if self._closed:
+                    return False
+                self.backend = backend
+                self.cap, cap = cap, None
+                return opened
+        finally:
             try:
-                self.cap.release()
-            except Exception:
-                pass
-        self.backend = 'csi-gstreamer'
-        self.cap = cv2.VideoCapture(self.pipeline, cv2.CAP_GSTREAMER)
-        return self.cap.isOpened()
+                if cap is not None:
+                    cap.release()
+            finally:
+                self._finish_capture_op()
+
+    def _finish_capture_op(self):
+        with self._capture_lock:
+            self._capture_ops -= 1
+            # Giu khoa camera cho den khi moi lan open/release native da xong.
+            if self._closed and self._capture_ops == 0:
+                self._lease.release()
 
     def _open_csi_with_retry(self):
         for attempt in range(1, self.csi_open_attempts + 1):
@@ -257,31 +294,30 @@ class CSISource(FrameSource):
                 format_camera_environment()))
 
     def _switch_to_usb(self, reason):
-        try:
-            self.cap.release()
-        except Exception:
-            pass
         self.startup_notes.append(
             'CSI loi (%s) -> thu USB/V4L2 index %d' % (reason, self.usb_index))
-        self.cap = cv2.VideoCapture(self.usb_index)
-        self.backend = 'usb-v4l2-index-%d' % self.usb_index
-        if not self.cap.isOpened():
-            self.cap.release()
+        opened = self._replace_capture('usb-v4l2-index-%d' % self.usb_index, self.usb_index)
+        if self._closed:
+            return False
+        if not opened:
             raise IOError(self._failure_message(
                 'CSI va USB/V4L2 index %d deu khong open duoc' % self.usb_index))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
         self._needs_warmup = True
+        return True
 
     def _read_with_warmup(self):
         last_exception = None
         for _ in range(self.startup_attempts):
+            cap = self.cap
+            if self._closed or cap is None:
+                return False, None
             try:
-                ok, frame = self.cap.read()
+                ok, frame = cap.read()
             except Exception as exc:
                 ok, frame = False, None
                 last_exception = exc
+            if self._closed:
+                return False, None
             if ok and frame is not None:
                 self.last_error = None
                 return True, frame
@@ -294,6 +330,16 @@ class CSISource(FrameSource):
         return False, None
 
     def read(self):
+        with self._capture_lock:
+            if self._closed:
+                return False, None
+            self._capture_ops += 1
+        try:
+            return self._read()
+        finally:
+            self._finish_capture_op()
+
+    def _read(self):
         if self._needs_warmup:
             self._needs_warmup = False
             ok, frame = self._read_with_warmup()
@@ -304,6 +350,8 @@ class CSISource(FrameSource):
             if self.backend == 'csi-gstreamer' and self.csi_open_attempts > 1:
                 initial_error = self.last_error
                 for attempt in range(2, self.csi_open_attempts + 1):
+                    if self._closed:
+                        return False, None
                     self.startup_notes.append(
                         'CSI co open nhung khong co frame; mo lai lan %d/%d' %
                         (attempt, self.csi_open_attempts))
@@ -314,8 +362,11 @@ class CSISource(FrameSource):
                         if ok:
                             return ok, frame
                 self.last_error = initial_error
+            if self._closed:
+                return False, None
             if self.backend == 'csi-gstreamer' and self.allow_usb_fallback:
-                self._switch_to_usb(self.last_error)
+                if not self._switch_to_usb(self.last_error):
+                    return False, None
                 self._needs_warmup = False
                 ok, frame = self._read_with_warmup()
                 if ok:
@@ -334,8 +385,12 @@ class CSISource(FrameSource):
             try:
                 ok, frame = cap.read()
             except Exception as exc:
+                if self._closed:
+                    return False, None
                 self.last_error = '%s read exception: %s' % (self.backend, exc)
                 raise IOError(self.last_error)
+            if self._closed:
+                return False, None
             if ok and frame is not None:
                 self.last_error = None
                 return True, frame
@@ -348,13 +403,17 @@ class CSISource(FrameSource):
         return False, None
 
     def release(self):
+        with self._capture_lock:
+            if self._closed:
+                return
+            self._closed = True
+            cap, self.cap = self.cap, None
+            self._capture_ops += 1
         try:
-            cap = self.cap
-            self.cap = None
             if cap is not None:
                 cap.release()
         finally:
-            self._lease.release()
+            self._finish_capture_op()
 
 
 class SyncGrabber(object):

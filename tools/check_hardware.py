@@ -119,12 +119,12 @@ def check_power_mode():
     return False
 
 
-def check_config():
+def check_config(overrides=None):
     step(3, 'Config')
     from jetracer_baseline.config import load_config
     path = os.path.join(ROOT, 'configs', 'default.yaml')
     try:
-        cfg = load_config(path)
+        cfg = load_config(path, [os.path.join(ROOT, p) for p in (overrides or [])])
     except Exception as exc:
         print('%s Khong nap duoc %s: %s' % (FAIL, path, exc))
         return None
@@ -152,12 +152,15 @@ def check_camera(cfg, seconds, out_dir):
 
     print('       Backend ban dau: %s' % getattr(source, 'backend', 'khong ro'))
 
-    n, t0, first = 0, time.time(), None
+    n, t0, first = 0, time.monotonic(), None
     read_error = None
     try:
-        while (time.time() - t0) < seconds:
+        while (time.monotonic() - t0) < seconds:
             ok, frame = source.read()
             if not ok:
+                if n:
+                    read_error = IOError(getattr(source, 'last_error', None) or
+                                         'Mat frame truoc khi het thoi gian kiem tra')
                 break
             if first is None:
                 first = frame
@@ -165,6 +168,7 @@ def check_camera(cfg, seconds, out_dir):
     except Exception as exc:
         read_error = exc
     finally:
+        dt = time.monotonic() - t0
         source.release()
 
     print('       Backend su dung: %s' % getattr(source, 'backend', 'khong ro'))
@@ -190,7 +194,6 @@ def check_camera(cfg, seconds, out_dir):
         print('         sudo systemctl restart nvargus-daemon')
         return False
 
-    dt = time.time() - t0
     h, w = first.shape[:2]
     fps = n / dt if dt > 0 else 0.0
     print('%s Doc %d frame trong %.1f s -> %.1f FPS, do phan giai %dx%d'
@@ -402,6 +405,8 @@ def main(argv=None):
     parser.add_argument('--driver', choices=['dryrun', 'nvidia', 'ros'],
                         default='dryrun')
     parser.add_argument('--camera-seconds', type=float, default=3.0)
+    parser.add_argument('--camera-only', action='store_true', help='Chi test camera, khong nap driver')
+    parser.add_argument('--override', action='append', default=[], help='Profile YAML, ap theo thu tu')
     parser.add_argument('--out', default='reports')
     parser.add_argument('--skip-camera', action='store_true')
     parser.add_argument('--actuator', action='store_true',
@@ -425,9 +430,13 @@ def main(argv=None):
         print('\nDung lai: thieu thu vien co ban.')
         return 1
 
+    if args.camera_only:
+        cfg = check_config(args.override)
+        return 0 if cfg is not None and check_camera(cfg, args.camera_seconds, args.out) else 1
+
     results['power'] = check_power_mode()
 
-    cfg = check_config()
+    cfg = check_config(args.override)
     results['config'] = cfg is not None
     if cfg is None:
         return 1

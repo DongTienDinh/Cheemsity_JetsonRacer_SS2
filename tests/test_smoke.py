@@ -244,6 +244,75 @@ def test_csi_open_without_frame_reopens_argus_before_usb():
         camera_mod.cv2.VideoCapture = original
 
 
+def test_csi_close_during_startup_drops_late_capture_and_keeps_lease():
+    import jetracer_baseline.camera as camera_mod
+
+    original_capture = camera_mod.cv2.VideoCapture
+    original_lease = camera_mod.CameraLease
+    for pause_at in ('read', 'reopen'):
+        entered, unblock = threading.Event(), threading.Event()
+        captures, results = [], []
+
+        class Capture(object):
+            released = False
+
+            def isOpened(self):
+                return True
+
+            def read(self):
+                if pause_at == 'read':
+                    entered.set()
+                    unblock.wait(2.0)
+                return False, None
+
+            def release(self):
+                self.released = True
+
+        class Lease(object):
+            released = False
+
+            def acquire(self):
+                pass
+
+            def release(self):
+                self.released = True
+
+        def open_mock(*_args):
+            cap = Capture()
+            captures.append(cap)
+            if pause_at == 'reopen' and len(captures) == 2:
+                entered.set()
+                unblock.wait(2.0)
+            return cap
+
+        camera_mod.cv2.VideoCapture = open_mock
+        camera_mod.CameraLease = Lease
+        source = thread = None
+        try:
+            source = CSISource(320, 240, 30, startup_attempts=1,
+                               startup_delay_s=0.0, csi_open_attempts=2,
+                               csi_retry_delay_s=0.0, allow_usb_fallback=False)
+            thread = threading.Thread(target=lambda: results.append(source.read()))
+            thread.start()
+            assert entered.wait(1.0)
+            source.release()
+            assert source.cap is None and not source._lease.released
+            unblock.set()
+            thread.join(2.0)
+            assert results == [(False, None)]
+            assert len(captures) == (1 if pause_at == 'read' else 2)
+            assert all(cap.released for cap in captures)
+            assert source.cap is None and source._lease.released
+        finally:
+            unblock.set()
+            if thread is not None:
+                thread.join(2.0)
+            if source is not None:
+                source.release()
+            camera_mod.cv2.VideoCapture = original_capture
+            camera_mod.CameraLease = original_lease
+
+
 def test_jetson_gstreamer_pipeline_has_low_latency_caps():
     pipeline = gstreamer_pipeline(
         640, 480, 30, flip_method=2,
