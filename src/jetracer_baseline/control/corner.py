@@ -35,11 +35,7 @@ CORNER = 'CUA'
 class CornerController(object):
     def __init__(self, cfg):
         self.reset_from_config(cfg)
-        self.mode = STRAIGHT
-        self._throttle = 0.0
-        self.steer_wanted = 0.0
-        self.steer_limit = self.steer_max
-        self._hold = 0.0
+        self.reset()
 
     def reset_from_config(self, cfg):
         c = cfg.get
@@ -77,6 +73,7 @@ class CornerController(object):
         self.curve_feedforward = float(c('control.curve_feedforward', 0.9))
         self.corner_steer_gain = float(c('control.corner_steer_gain', 1.6))
         self.road_turn_steer_gain = float(c('control.road_turn_steer_gain', 1.0))
+        self.road_turn_release_s = max(0.0, float(c('control.road_turn_release_s', 0.0)))
         self.steer_max = float(c('control.steer_max', 0.60))
         # Tran lai RIENG cho khuc cua. Cua cua sa ban rat hep nen can be gan het
         # lai, nhung dung tran do cho ca doan thang thi xe giat va de vuot lane.
@@ -96,6 +93,8 @@ class CornerController(object):
         self.steer_wanted = 0.0
         self.steer_limit = self.steer_max
         self._hold = 0.0
+        self._exit_steer = 0.0
+        self._exit_elapsed = 0.0
 
     # ------------------------------------------------------------------ mode
     def update_mode(self, curvature):
@@ -108,6 +107,29 @@ class CornerController(object):
                 self.mode = STRAIGHT
         return self.mode
 
+    def _steer_at_road_exit(self, steer, limit, road_turn, lane_found, dt):
+        duration = self.road_turn_release_s
+        if not lane_found or duration <= 0.0:
+            self._exit_steer = 0.0
+            return steer
+        if road_turn or (self.mode == CORNER and self._exit_steer):
+            direction = road_turn or self._exit_steer
+            self._exit_steer = max(-limit, min(limit, steer)) if steer * direction > 0.0 else 0.0
+            self._exit_elapsed = 0.0
+            return steer
+        if self._exit_steer == 0.0:
+            return steer
+
+        self._exit_elapsed += dt
+        if steer * self._exit_steer < 0.0 or self._exit_elapsed >= duration:
+            self._exit_steer = 0.0
+            return steer
+        # Chi giu phan lai dang bi nha. Lenh moi van co the tang lai cung chieu.
+        if abs(steer) < abs(self._exit_steer):
+            remaining = 1.0 - self._exit_elapsed / duration
+            steer += (self._exit_steer - steer) * remaining
+        return steer
+
     # ------------------------------------------------------------------- step
     def step(self, pid_output, cte, curvature, dt, lane_found=True, road_turn=0):
         """Tra ve (steer, throttle, mode).
@@ -115,6 +137,8 @@ class CornerController(object):
         `pid_output` la dau ra PID da tinh san - CornerController khong so huu
         PID, de vong goi quyet dinh dung sai so nao (cte hay tron voi diem ngam).
         """
+        if dt <= 0.0:
+            dt = 1e-3
         road_turn = road_turn if lane_found else 0
         if road_turn:
             self.mode = CORNER
@@ -130,6 +154,7 @@ class CornerController(object):
             if steer * road_turn > 0.0:
                 steer *= self.road_turn_steer_gain
             limit = self.corner_steer_max
+        steer = self._steer_at_road_exit(steer, limit, road_turn, lane_found, dt)
         self.steer_wanted = steer          # truoc khi cat, de bao chan tran
         steer = max(-limit, min(limit, steer))
         self.steer_limit = limit
@@ -152,8 +177,6 @@ class CornerController(object):
         target = max(self.v_min, min(self.v_max, target))
 
         # --- gioi han toc do doi ga ---------------------------------------
-        if dt <= 0.0:
-            dt = 1e-3
         delta = target - self._throttle
         if delta > 0:
             step = self.throttle_rise_rate * dt

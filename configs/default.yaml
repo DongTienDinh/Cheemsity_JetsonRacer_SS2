@@ -204,6 +204,7 @@ control:
   curve_feedforward: 0.9
   corner_steer_gain: 1.6   # trong chế độ CUA nhân thêm vào lái để bẻ gần hết
   road_turn_steer_gain: 1.15  # hệ số lái thêm khi mép xanh xác nhận hướng cua
+  road_turn_release_s: 0.30  # thời gian nhả lái sau cua do mép xanh xác nhận
   # Giới hạn tốc độ đổi ga: lên từ từ (bánh không trượt), xuống nhanh (thấy cua
   # là bỏ ga ngay).
   throttle_rise_rate: 0.8

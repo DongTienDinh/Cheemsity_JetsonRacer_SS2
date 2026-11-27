@@ -95,6 +95,7 @@ CONTROL_PARAMS = [
     ('control.curve_feedforward', 'Lai theo do cong', 0.0, 2.5, 0.05),
     ('control.corner_steer_gain', 'Boi lai khi cua', 1.0, 3.0, 0.05),
     ('control.road_turn_steer_gain', 'Lai cua gat', 1.0, 1.50, 0.05),
+    ('control.road_turn_release_s', 'Nha lai ra cua (s)', 0.0, 0.60, 0.05),
     ('control.steer_max', 'Lai toi da (thang)', 0.10, 1.00, 0.05),
     ('control.corner_steer_max', 'Lai toi da (CUA)', 0.10, 1.00, 0.05),
     ('control.pid.kp', 'PID Kp', 0.0, 2.0, 0.05),
@@ -2291,6 +2292,9 @@ class LaneTuningUI(object):
         lai_cua_gat = w.FloatSlider(
             value=float(g('control.road_turn_steer_gain', 1.0)),
             min=1.0, max=1.50, step=0.05, description='LAI CUA GAT', **L)
+        nha_lai = w.FloatSlider(
+            value=float(g('control.road_turn_release_s', 0.0)),
+            min=0.0, max=0.60, step=0.05, description='NHA LAI RA CUA (s)', **L)
         phanh = w.FloatSlider(
             value=self._cfg_to_phanh(g('control.curve_brake', 0.30)),
             min=0.0, max=1.0, step=0.05,
@@ -2301,7 +2305,7 @@ class LaneTuningUI(object):
             description='GOC LAI TOI DA', **L)
         # Moi num mot dong so RIENG ngay duoi. Doc dam, luon hien du cot hep.
         notes = dict((k, w.HTML()) for k in
-                     ('toc_do', 'toc_cua', 'cua_som', 'lai_cua_gat', 'phanh', 'goc_lai'))
+                     ('toc_do', 'toc_cua', 'cua_som', 'lai_cua_gat', 'nha_lai', 'phanh', 'goc_lai'))
         info = w.HTML()
 
         def _n(html):
@@ -2333,6 +2337,7 @@ class LaneTuningUI(object):
             notes['lai_cua_gat'].value = _n(
                 'nhan lai <b>%.2fx</b> khi mep xanh va diem ngam cung huong'
                 % gp('control.road_turn_steer_gain', 1.0))
+            notes['nha_lai'].value = _n('thoi gian nha lai dan sau cua gat')
             notes['phanh'].value = _n(
                 'phanh theo do cong <b>%.2f</b> &nbsp;|&nbsp; theo do lech '
                 '<b>%.2f</b>' % (gp('control.curve_brake', 0),
@@ -2387,6 +2392,8 @@ class LaneTuningUI(object):
             sl.observe(mk(fn), names='value')
         lai_cua_gat.observe(mk(lambda v: self.engine.set_param(
             'control.road_turn_steer_gain', v), update_speed_cap=False), names='value')
+        nha_lai.observe(mk(lambda v: self.engine.set_param(
+            'control.road_turn_release_s', v), update_speed_cap=False), names='value')
         _refresh()
 
         huong_dan = w.HTML(
@@ -2410,6 +2417,7 @@ class LaneTuningUI(object):
                        toc_cua, notes['toc_cua'],
                        cua_som, notes['cua_som'],
                        lai_cua_gat, notes['lai_cua_gat'],
+                       nha_lai, notes['nha_lai'],
                        phanh, notes['phanh'],
                        goc_lai, notes['goc_lai'],
                        info, huong_dan])

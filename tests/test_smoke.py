@@ -1421,6 +1421,24 @@ def test_confirmed_road_turn_boosts_steering_without_increasing_limits():
     assert ctrl.step(0.9, 0.0, 0.0, 1.0, road_turn=1)[0] == 0.60
 
 
+def test_confirmed_turn_releases_steering_gradually_and_cancels_on_direction_change():
+    ctrl = CornerController(_corner_cfg(control__road_turn_release_s=0.30,
+                                        control__road_turn_steer_gain=1.2))
+    for direction in (-1, 1):
+        ctrl.reset()
+        before, _, _ = ctrl.step(direction * 0.25, 0.0, 0.0, 0.10, road_turn=direction)
+        released = [ctrl.step(0.0, 0.0, 0.0, 0.10)[0] for _ in range(3)]
+        assert np.allclose(released, [before * 2.0 / 3.0, before / 3.0, 0.0])
+
+    ctrl.step(0.25, 0.0, 0.0, 0.10, road_turn=1)
+    assert ctrl.step(-0.05, 0.0, 0.0, 0.10)[0] == -0.05
+    assert ctrl.step(0.0, 0.0, 0.0, 0.10)[0] == 0.0
+
+    ctrl.step(0.25, 0.0, 0.0, 0.10, road_turn=1)
+    assert ctrl.step(0.0, 0.0, 0.0, 0.10, lane_found=False)[0] == 0.0
+    assert ctrl.step(0.0, 0.0, 0.0, 0.10)[0] == 0.0
+
+
 def test_corner_controller_feedforward_steers_into_the_bend():
     """Cua hep can danh lai NGAY khi thay duong cong, khong doi CTE tang."""
     cfg = _corner_cfg(control__curve_feedforward=0.9,
