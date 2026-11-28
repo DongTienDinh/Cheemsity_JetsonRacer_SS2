@@ -3280,27 +3280,6 @@ def test_road_pure_pursuit_controller_and_config():
     assert res1.found and det.road_guided
     assert det.last_road_logits is not None and det.last_road_logits.shape == (SEG_H, SEG_W)
 
-    # 5. Giao dien dieu khien Pure Pursuit rut gon con dung 5 thanh thuc te
-    from jetracer_baseline.tuning_ui import PURE_PURSUIT_PARAMS
-    assert [row[0] for row in PURE_PURSUIT_PARAMS] == [
-        'control.v_straight',
-        'control.v_corner',
-        'control.driver.steering_output_max',
-        'control.pure_pursuit.lookahead_px',
-        'control.pure_pursuit.gain',
-    ]
-    ui_fake = LaneTuningUI.__new__(LaneTuningUI)
-    eng = LaneTuningEngine(CONFIG)
-    eng.cfg = cfg
-    eng.rebuild()
-    ui_fake.engine = eng
-    ui_fake._apply_pp_slider('control.driver.steering_output_max', 0.50)
-    assert abs(ui_fake.engine.get_param('control.driver.steering_output_min') + 0.50) < 1e-6
-    assert abs(ui_fake.engine.get_param('control.driver.steering_output_max') - 0.50) < 1e-6
-    assert ui_fake.engine.get_param('control.steer_max') > 0.70
-    ui_fake._apply_pp_slider('control.v_straight', 0.45)
-    assert ui_fake.engine.get_param('control.v_max') >= 0.45
-
 
 if __name__ == '__main__':
     failures = 0

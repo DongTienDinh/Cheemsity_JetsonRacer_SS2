@@ -111,17 +111,6 @@ CONTROL_PARAMS = [
     ('control.v_max', 'Tran ga (an toan)', 0.00, 0.80, 0.01),
 ]
 
-# Giao dien dieu khien rut gon cho bo dieu khien moi (Road-Only Pure Pursuit):
-# Giu nguyen toan bo thuat toan Pure Pursuit o duoi, tren UI chi bay 5 thanh
-# thuc te nhat khi chay thu: toc do thang, toc do cua, do cua servo, tam ngam, do nhay lai.
-PURE_PURSUIT_PARAMS = [
-    ('control.v_straight', 'Toc do thang', 0.05, 0.80, 0.01),
-    ('control.v_corner', 'Toc do trong cua', 0.05, 0.50, 0.01),
-    ('control.driver.steering_output_max', 'Do cua servo (+-)', 0.30, 0.85, 0.05),
-    ('control.pure_pursuit.lookahead_px', 'Tam ngam cua (px)', 50.0, 140.0, 2.0),
-    ('control.pure_pursuit.gain', 'Do nhay lai', 0.60, 2.00, 0.05),
-]
-
 
 # Slider rieng cho che do LAI TAY. Tach khoi CONTROL_PARAMS vi day la gioi han
 # cua NGUOI lai, khong lien quan gi den bo dieu khien tu dong - tron hai nhom se
@@ -1018,24 +1007,10 @@ class LaneTuningUI(object):
             description='Sua mau (shading)')
 
         self._sliders = {}
-        # Chon dung bo slider theo nguon bam vach va bo dieu khien dang chay.
+        # Chon dung bo slider theo nguon bam vach dang chay.
         self.dung_cnn = type(self.engine.lane).__name__ == 'CnnLaneDetector'
-        self.is_pure_pursuit = (
-            getattr(self.engine, 'control_mode', 'corner') == 'pure_pursuit')
-        self.is_road_only = bool(
-            self.engine.get_param('lane.cnn.road_only', False))
-        if self.dung_cnn and self.is_road_only:
-            self.lane_box = widgets.VBox([
-                widgets.HTML(
-                    '<div style="padding:8px;border-radius:4px;background:#f0fdf4;'
-                    'border:1px solid #86efac;font-size:12px;line-height:1.5">'
-                    '<b>Che do chi dung mat duong Ch0 (Road-Only)</b><br>'
-                    'Khong can chinh nguong mau hay tham so tam vang Ch2.<br>'
-                    'Chuyen sang tab <b>Dieu khien</b> de chinh toc do, do cua servo va Pure Pursuit.</div>')
-            ])
-        else:
-            self.lane_box = self._build_sliders(
-                CNN_LANE_PARAMS if self.dung_cnn else LANE_PARAMS)
+        self.lane_box = self._build_sliders(
+            CNN_LANE_PARAMS if self.dung_cnn else LANE_PARAMS)
         self.simple_box = None      # che do don gian tu dung num rieng
         self._logger = None
         self._logger_lock = threading.Lock()
@@ -1043,10 +1018,7 @@ class LaneTuningUI(object):
         self._run_started_mono = None
         self._last_run_summary = None
         self.log_dir = str(self.engine.get_param('logging.dir', 'logs'))
-        if self.is_pure_pursuit:
-            self.control_box = self._build_pp_sliders()
-        else:
-            self.control_box = self._build_sliders(CONTROL_PARAMS)
+        self.control_box = self._build_sliders(CONTROL_PARAMS)
         self.manual_box = self._build_sliders(MANUAL_PARAMS,
                                               on_change=self._apply_manual)
 
@@ -2420,132 +2392,16 @@ class LaneTuningUI(object):
     def _cfg_to_cua_som(curve_enter):
         return max(0.0, min(1.0, (0.30 - float(curve_enter)) / 0.24))
 
-    def _apply_pp_slider(self, key, val):
-        """Ap thanh chinh giao dien Pure Pursuit: dong bo v_max & tran servo doi xung."""
-        val = float(val)
-        if key == 'control.driver.steering_output_max':
-            self.engine.set_param('control.driver.steering_output_max', val)
-            self.engine.set_param('control.driver.steering_output_min', -val)
-            gain_abs = max(
-                1e-6, abs(float(self.engine.get_param('control.driver.steering_gain', -0.65))))
-            need_steer = min(1.0, round(val / gain_abs, 3))
-            self.engine.set_param('control.steer_max', need_steer)
-            self.engine.set_param('control.corner_steer_max', need_steer)
-        else:
-            self.engine.set_param(key, val)
-            if key in ('control.v_straight', 'control.v_corner'):
-                v_str = float(self.engine.get_param('control.v_straight', 0.30))
-                v_cor = float(self.engine.get_param('control.v_corner', 0.12))
-                hi = max(v_str, v_cor)
-                cur_vmax = float(self.engine.get_param('control.v_max', 0.35))
-                if hi > cur_vmax:
-                    self.engine.set_param('control.v_max', round(min(1.0, hi * 1.15), 3))
-                cur_vmin = float(self.engine.get_param('control.v_min', 0.10))
-                if v_cor < cur_vmin:
-                    self.engine.set_param('control.v_min', round(max(0.0, v_cor), 3))
-
-    def _build_pp_sliders(self):
-        """Bo 5 thanh rut gon cho tab Dieu khien (simple=False) khi dung Pure Pursuit."""
-        w = self.widgets
-        rows = []
-        for key, label, lo, hi, step in PURE_PURSUIT_PARAMS:
-            cur = float(self.engine.get_param(key, (lo + hi) * 0.5))
-            sl = w.FloatSlider(
-                value=cur, min=float(lo), max=float(hi), step=float(step),
-                description=label, readout_format='.2f', continuous_update=False,
-                style={'description_width': '160px'},
-                layout=w.Layout(width='420px'))
-
-            def _make_obs(k):
-                def _h(change):
-                    with self._engine_lock:
-                        self._apply_pp_slider(k, change['new'])
-                return _h
-
-            sl.observe(_make_obs(key), names='value')
-            self._sliders[key] = sl
-            rows.append(sl)
-        return w.VBox(rows)
-
     def _build_simple_panel(self):
-        """Bang chinh don gian — rut gon dung 5 thanh chinh khi dung Pure Pursuit."""
+        """Bon num. Moi num viet mot NHOM khoa di lien voi nhau."""
         w = self.widgets
         g = self.engine.get_param
+        # Nhan hep lai va slider ngan lai de o doc so KHONG bi cot phai cat mat.
+        # Truoc day nhan 150px + slider 440px bi tran ra ngoai cot, nguoi dung
+        # chi thay mot chu so o ria.
         L = dict(style={'description_width': '128px'},
-                 layout=w.Layout(width='350px'),
+                 layout=w.Layout(width='340px'),
                  readout_format='.2f', continuous_update=False)
-
-        if getattr(self.engine, 'control_mode', 'corner') == 'pure_pursuit':
-            sl_vstr = w.FloatSlider(
-                value=float(g('control.v_straight', 0.30)),
-                min=0.05, max=0.80, step=0.01, description='TOC DO thang', **L)
-            sl_vcor = w.FloatSlider(
-                value=float(g('control.v_corner', 0.12)),
-                min=0.05, max=0.50, step=0.01, description='TOC DO cua', **L)
-            sl_srv = w.FloatSlider(
-                value=float(g('control.driver.steering_output_max', 0.40)),
-                min=0.30, max=0.85, step=0.05, description='DO CUA servo', **L)
-            sl_ld = w.FloatSlider(
-                value=float(g('control.pure_pursuit.lookahead_px', 84.0)),
-                min=50.0, max=140.0, step=2.0, description='TAM NGAM (px)', **L)
-            sl_gain = w.FloatSlider(
-                value=float(g('control.pure_pursuit.gain', 1.15)),
-                min=0.60, max=2.00, step=0.05, description='DO NHAY lai', **L)
-
-            notes = dict((k, w.HTML()) for k in ('vstr', 'vcor', 'srv', 'ld', 'gain'))
-
-            def _sub(html):
-                return ('<div style="margin:-8px 0 10px 132px;font-size:11px;'
-                        'color:#333;line-height:1.4">%s</div>' % html)
-
-            def _refresh_pp():
-                vstr = float(g('control.v_straight', 0.30))
-                vcor = float(g('control.v_corner', 0.12))
-                vmax = float(g('control.v_max', 0.35))
-                srv = float(g('control.driver.steering_output_max', 0.40))
-                ld = float(g('control.pure_pursuit.lookahead_px', 84.0))
-                gn = float(g('control.pure_pursuit.gain', 1.15))
-                notes['vstr'].value = _sub(
-                    'ga thang = <b>%.2f</b> &nbsp; (tran ga: <b>%.2f</b>)' % (vstr, vmax))
-                notes['vcor'].value = _sub(
-                    'ga trong cua = <b>%.2f</b> &nbsp; (giam neu xe vang ra ngoai cua)' % vcor)
-                notes['srv'].value = _sub(
-                    'tran servo = <b>&plusmn;%.2f</b> &nbsp; (mac dinh default.yaml: &plusmn;0.40)' % srv)
-                notes['ld'].value = _sub(
-                    'ngam truoc <b>%.0f px</b> &nbsp; (giam neu cua rong, tang neu thang lac)' % ld)
-                notes['gain'].value = _sub(
-                    'he so lai = <b>%.2f</b> &nbsp; (tang nhe neu be lai thieu)' % gn)
-
-            def _mk_pp(key):
-                def _h(change):
-                    with self._engine_lock:
-                        self._apply_pp_slider(key, change['new'])
-                    _refresh_pp()
-                return _h
-
-            for sl, key in (
-                (sl_vstr, 'control.v_straight'),
-                (sl_vcor, 'control.v_corner'),
-                (sl_srv, 'control.driver.steering_output_max'),
-                (sl_ld, 'control.pure_pursuit.lookahead_px'),
-                (sl_gain, 'control.pure_pursuit.gain'),
-            ):
-                sl.observe(_mk_pp(key), names='value')
-                self._sliders[key] = sl
-            _refresh_pp()
-
-            warn_srv = w.HTML(
-                '<div style="margin-top:4px;font-size:11px;color:#b00020;max-width:350px;line-height:1.45">'
-                '<b>Luu y DO CUA servo:</b> chi tang tung nac 0.05 khi da ke banh khoi mat dat; '
-                'nghe servo keu ken thi lui lai 1 nac.</div>')
-            return w.VBox([
-                sl_vstr, notes['vstr'],
-                sl_vcor, notes['vcor'],
-                sl_srv, notes['srv'],
-                sl_ld, notes['ld'],
-                sl_gain, notes['gain'],
-                warn_srv,
-            ])
 
         # Dai noi rong de dua toc do. Tran an toan that su van la
         # `control.v_max`, tu nang theo hai num nay.
@@ -2670,6 +2526,12 @@ class LaneTuningUI(object):
             # Doi CA HAI chieu; doi mot ben thi xe chi cua duoc mot huong.
             self.engine.set_param('control.driver.steering_output_max', v)
             self.engine.set_param('control.driver.steering_output_min', -v)
+            if getattr(self.engine, 'control_mode', 'corner') == 'pure_pursuit':
+                gain_abs = max(1e-6, abs(float(
+                    self.engine.get_param('control.driver.steering_gain', -0.65))))
+                need_steer = min(1.0, round(v / gain_abs, 3))
+                self.engine.set_param('control.steer_max', need_steer)
+                self.engine.set_param('control.corner_steer_max', need_steer)
 
         for sl, fn in ((toc_do, set_toc_do), (toc_cua, set_toc_cua),
                        (cua_som, set_cua_som), (giam_toc, set_giam_toc),
