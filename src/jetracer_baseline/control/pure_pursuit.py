@@ -488,13 +488,15 @@ class RoadPurePursuitController(object):
             ramp_u = min(1.0, (abs(raw_u) - 0.28) / 0.35)
             raw_u = raw_u * (1.0 + (u_turn_gain - 1.0) * ramp_u)
         # Khi xe dang o GIUA cua chu U gat (ca `|raw_u|` lan `u_level` cung cao & cung huong):
-        # day thang toi 100% tran `steer_span` (HET LAI) va tang do nhay EMA de kip om cua!
+        # day thang toi 100% tran `steer_span` (HET LAI). Keo `LAI CUA GAT` len 1.5..2.0
+        # se vao full-lock som & dut khoat hon nua!
         in_u_apex = 0.0
-        if abs(raw_u) > 0.55 and u_level > 0.35 and (raw_u * u_sign > 0.0):
-            in_u_apex = min(1.0, (abs(raw_u) - 0.55) / 0.35) * u_level
+        apex_thr = max(0.32, 0.55 - 0.30 * max(0.0, u_turn_gain - 1.40))
+        if abs(raw_u) > apex_thr and u_level > 0.30 and (raw_u * u_sign > 0.0):
+            in_u_apex = min(1.0, (abs(raw_u) - apex_thr) / 0.32) * u_level
         raw_steer = raw_u * steer_ref
         if in_u_apex > 0.0:
-            full_target = steer_span * (0.80 + 0.20 * in_u_apex)
+            full_target = steer_span * min(1.0, 0.80 + 0.20 * in_u_apex + 0.20 * max(0.0, u_turn_gain - 1.40))
             if abs(raw_steer) < full_target:
                 raw_steer = (1.0 if raw_steer >= 0.0 else -1.0) * full_target
         self.steer_wanted = float(raw_steer)

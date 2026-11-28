@@ -1318,12 +1318,13 @@ class SimulatorSession(object):
             v_cor_ui = float(self.params.get('v_corner', fx['v_corner']))
             srv_lim_ui = float(self.params.get('servo_limit', 1.00))
             drv_steer_gain = -1.00 if self.controller_name == 'road_pure_pursuit' else float(fx['steering_gain'])
-            drv_thr_gain = float(fx['throttle_gain'])
+            drv_thr_gain = 1.00 if self.controller_name == 'road_pure_pursuit' else float(fx['throttle_gain'])
             if self.controller_name == 'road_pure_pursuit':
                 self.pp_ctrl.v_straight = v_str_ui
                 self.pp_ctrl.v_corner = v_cor_ui
-                self.pp_ctrl.v_max = max(0.475, float(fx['v_max']), v_str_ui, v_cor_ui)
+                self.pp_ctrl.v_max = min(1.0, max(0.375, float(fx['v_max']), v_str_ui, v_cor_ui))
                 self.pp_ctrl.v_min = min(float(fx['v_min']), v_cor_ui)
+                self.pp_ctrl.throttle_rise_rate = 1.40
                 self.pp_ctrl.drv_steer_gain = drv_steer_gain
                 self.pp_ctrl.drv_out_max = srv_lim_ui
                 self.pp_ctrl.steer_max = min(1.0, srv_lim_ui)

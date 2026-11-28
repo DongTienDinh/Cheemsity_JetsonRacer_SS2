@@ -27,6 +27,7 @@ control:
   v_straight: 0.30
   v_corner: 0.12
   v_max: 0.375
+  throttle_rise_rate: 1.40
   curve_enter: 0.06
   curve_exit: 0.039
   curve_feedforward: 2.20
@@ -43,6 +44,7 @@ control:
   corner_steer_max: 1.00
   driver:
     steering_gain: -1.00
+    throttle_gain: 1.00
     steering_output_min: -1.00
     steering_output_max: 1.00
   pure_pursuit:

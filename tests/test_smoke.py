@@ -3236,6 +3236,7 @@ def test_road_pure_pursuit_controller_and_config():
     assert cfg.get('control.driver.steering_output_min') == -1.00
     assert cfg.get('control.driver.steering_output_max') == 1.00
     assert cfg.get('control.driver.steering_gain') == -1.00
+    assert cfg.get('control.driver.throttle_gain') == 1.00
     assert cfg.get('control.v_straight') == 0.30
     assert cfg.get('control.v_corner') == 0.12
     assert cfg.get('control.road_turn_steer_gain') == 1.40

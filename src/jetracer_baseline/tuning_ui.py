@@ -90,13 +90,13 @@ CNN_LANE_PARAMS = [
 SIMPLE_PARAMS = []
 
 CONTROL_PARAMS = [
-    ('control.v_straight', 'Ga doan THANG', 0.00, 0.60, 0.01),
-    ('control.v_corner', 'Ga khi vao CUA', 0.00, 0.40, 0.01),
+    ('control.v_straight', 'Ga doan THANG', 0.00, 1.00, 0.01),
+    ('control.v_corner', 'Ga khi vao CUA', 0.00, 1.00, 0.01),
     ('control.curve_enter', 'Nguong VAO cua', 0.05, 0.80, 0.01),
     ('control.curve_exit', 'Nguong RA cua', 0.02, 0.70, 0.01),
     ('control.curve_feedforward', 'Lai theo do cong', 0.0, 2.5, 0.05),
     ('control.corner_steer_gain', 'Boi lai khi cua', 1.0, 3.0, 0.05),
-    ('control.road_turn_steer_gain', 'Lai cua gat', 1.0, 1.50, 0.05),
+    ('control.road_turn_steer_gain', 'Lai cua gat', 1.0, 2.00, 0.05),
     ('control.road_turn_release_s', 'Nha lai ra cua (s)', 0.0, 0.60, 0.05),
     ('control.pre_corner_decel', 'Giam toc truoc cua', 0.0, 1.0, 0.05),
     ('control.corner_enter_delay_s', 'Tre vao cua (s)', 0.0, 0.50, 0.02),
@@ -107,8 +107,8 @@ CONTROL_PARAMS = [
     ('control.pid.kd', 'PID Kd', 0.0, 1.0, 0.01),
     ('control.steer_lookahead_weight', 'Trong so diem ngam', 0.0, 1.0, 0.05),
     ('control.slowdown', 'Bo ga theo lech', 0.0, 1.0, 0.01),
-    ('control.v_min', 'Ga toi thieu', 0.00, 0.40, 0.01),
-    ('control.v_max', 'Tran ga (an toan)', 0.00, 0.80, 0.01),
+    ('control.v_min', 'Ga toi thieu', 0.00, 0.60, 0.01),
+    ('control.v_max', 'Tran ga (an toan)', 0.00, 1.00, 0.01),
 ]
 
 
@@ -2416,7 +2416,7 @@ class LaneTuningUI(object):
             min=0.0, max=1.0, step=0.05, description='CUA SOM', **L)
         lai_cua_gat = w.FloatSlider(
             value=float(g('control.road_turn_steer_gain', 1.0)),
-            min=1.0, max=1.50, step=0.05, description='LAI CUA GAT', **L)
+            min=1.0, max=2.00, step=0.05, description='LAI CUA GAT', **L)
         nha_lai = w.FloatSlider(
             value=float(g('control.road_turn_release_s', 0.0)),
             min=0.0, max=0.60, step=0.05, description='NHA LAI RA CUA (s)', **L)
