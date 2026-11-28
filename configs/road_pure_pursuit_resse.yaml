@@ -23,10 +23,10 @@ lane:
 
 control:
   mode: pure_pursuit
-  # 9 tham so UI da chuan hoa theo profile chay that tren xe:
-  v_straight: 0.38
-  v_corner: 0.30
-  v_max: 0.475
+  # Mac dinh toc do mo phong an toan (de tu keo tang dan tren san) + full-lock cua chu U:
+  v_straight: 0.30
+  v_corner: 0.12
+  v_max: 0.375
   curve_enter: 0.06
   curve_exit: 0.039
   curve_feedforward: 2.20
@@ -36,9 +36,9 @@ control:
   curvy_zone_enabled: false
   curvy_steer_boost: 1.20
   curvy_lookahead_scale: 0.65
-  pre_corner_decel: 0.90
+  pre_corner_decel: 0.50
   curve_brake: 0.00
-  slowdown: 0.32
+  slowdown: 0.20
   steer_max: 1.00
   corner_steer_max: 1.00
   driver:

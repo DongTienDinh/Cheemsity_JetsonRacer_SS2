@@ -3232,14 +3232,14 @@ def test_road_pure_pursuit_controller_and_config():
     assert base_cfg.get('control.v_corner') == 0.12
 
     cfg = load_config(CONFIG, [pp_yaml])
-    # road_pure_pursuit.yaml chuan hoa dung bo 9 thanh UI + mo khoa du 100% tam servo
+    # road_pure_pursuit.yaml: toc do mo phong an toan 0.30/0.12 + mo khoa du 100% tam servo
     assert cfg.get('control.driver.steering_output_min') == -1.00
     assert cfg.get('control.driver.steering_output_max') == 1.00
     assert cfg.get('control.driver.steering_gain') == -1.00
-    assert cfg.get('control.v_straight') == 0.38
-    assert cfg.get('control.v_corner') == 0.30
+    assert cfg.get('control.v_straight') == 0.30
+    assert cfg.get('control.v_corner') == 0.12
     assert cfg.get('control.road_turn_steer_gain') == 1.40
-    assert cfg.get('control.pre_corner_decel') == 0.90
+    assert cfg.get('control.pre_corner_decel') == 0.50
     assert cfg.get('control.mode') == 'pure_pursuit'
     assert cfg.get('lane.cnn.road_only') is True
 

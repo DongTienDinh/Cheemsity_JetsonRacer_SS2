@@ -974,11 +974,11 @@ class SimulatorSession(object):
 
         self.fixed_default = load_fixed_default_yaml()
         self.params = {
-            # Profile da chuan hoa theo 9 thanh UI chay that cua xe (TOC DO 0.38/0.30, SERVO +-1.00, DECEL 0.90)
-            'v_straight': 0.38,
-            'v_corner': 0.30,
+            # Mac dinh toc do mo phong an toan (0.30 / 0.12) + mo khoa 100% servo cua chu U
+            'v_straight': 0.30,
+            'v_corner': 0.12,
             'servo_limit': 1.00,
-            'pre_corner_decel': 0.90,
+            'pre_corner_decel': 0.50,
             'road_turn_steer_gain': 1.40,
             'car_length': 76.0,          # dung chieu dai chu START
             'car_width': 21.0,           # dung chieu rong chu START
