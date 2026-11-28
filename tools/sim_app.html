@@ -213,12 +213,12 @@
           <input type="range" id="s_servo_limit" min="0.30" max="1.00" step="0.05" value="1.00" />
         </div>
         <div class="slider-item" id="wrap_pp_lookahead">
-          <div class="slider-head"><span>4. Tầm ngắm cua (px)</span><span class="val" id="v_pp_lookahead_px">88</span></div>
-          <input type="range" id="s_pp_lookahead_px" min="50" max="140" step="2" value="88" />
+          <div class="slider-head"><span>4. Tầm ngắm cua (px)</span><span class="val" id="v_pp_lookahead_px">78</span></div>
+          <input type="range" id="s_pp_lookahead_px" min="50" max="140" step="2" value="78" />
         </div>
         <div class="slider-item" id="wrap_pp_gain">
-          <div class="slider-head"><span>5. Độ nhạy lái (Gain)</span><span class="val" id="v_pp_gain">1.15</span></div>
-          <input type="range" id="s_pp_gain" min="0.60" max="2.00" step="0.05" value="1.15" />
+          <div class="slider-head"><span>5. Độ nhạy lái (Gain)</span><span class="val" id="v_pp_gain">1.20</span></div>
+          <input type="range" id="s_pp_gain" min="0.60" max="2.00" step="0.05" value="1.20" />
         </div>
         <div class="slider-item" id="wrap_ftg_gain" style="display:none;">
           <div class="slider-head"><span>4. Follow-Gap Gain</span><span class="val" id="v_ftg_gain">1.25</span></div>
@@ -872,13 +872,13 @@ document.getElementById('btnResetDefaults').onclick = async () => {
     v_straight: 0.38,
     v_corner: 0.30,
     servo_limit: 1.00,
-    pp_lookahead_px: 88,
-    pp_gain: 1.15,
+    pp_lookahead_px: 78,
+    pp_gain: 1.20,
     ftg_gain: 1.25,
     ftg_bubble: 5,
   });
   await pushConfig();
-  setStatus('Đã đưa về profile chuẩn (0.38 / 0.30 / servo ±1.00)', 'ok');
+  setStatus('Đã đưa về profile chuẩn cua chữ U gắt (0.38 / 0.30 / servo ±1.00)', 'ok');
 };
 
 document.getElementById('selModel').onchange = pushConfig;

@@ -1,7 +1,8 @@
 # Chế độ KHUYÊN DÙNG cho Speed Track: Road-Only Pure Pursuit + LaneTiny-Fast (30+ FPS Nano)
-#   - Đã chuẩn hóa theo profile chạy thực tế trên xe (TOC DO 0.38 / 0.30, GOC LAI TOI DA 1.00,
-#     GIAM TOC TRUOC CUA 0.90) — giữ nguyên configs/default.yaml không sửa.
-#   - Chỉ dùng duy nhất kênh Ch0 (drivable_road) của model 1 kênh (bỏ Ch1 trắng, Ch2 tâm ảo & LiDAR).
+#   - Đã chuẩn hóa theo profile 9 thanh UI chạy thật (TOC DO 0.38/0.30, CUA SOM 1.00,
+#     LAI CUA GAT 1.40, GIAM TOC TRUOC CUA 0.90, GOC LAI TOI DA 1.00).
+#   - Đã mở khóa steering_gain = -1.00 để servo chạm ĐỦ ±1.00 (100% tầm lái) khi vào cua chữ U gắt!
+#   - Giữ nguyên configs/default.yaml không sửa.
 #
 # Cách chạy trên Jetson Nano:
 #   python3 -m src.jetracer_baseline.cli run --task speed --driver nvidia \
@@ -50,16 +51,18 @@ control:
   steer_max: 1.00
   corner_steer_max: 1.00
   driver:
+    # Mo khoa du 100% tam quay servo khi GOC LAI TOI DA = 1.00 (truoc bi chan o 0.65!)
+    steering_gain: -1.00
     steering_output_min: -1.00
     steering_output_max: 1.00
   pure_pursuit:
-    lookahead_px: 88.0
-    gain: 1.15
+    lookahead_px: 78.0
+    gain: 1.20
     half_lane_px: 82.0
     wheel_deg_at_limit: 34.0
-    servo_ref_at_limit: 0.39
+    servo_ref_at_limit: 0.72
     car_length_px: 76.0
-    edge_margin_px: 54.0
-    edge_push_gain: 0.45
+    edge_margin_px: 56.0
+    edge_push_gain: 0.65
     steer_smooth: 0.72
     max_hole_area: 180

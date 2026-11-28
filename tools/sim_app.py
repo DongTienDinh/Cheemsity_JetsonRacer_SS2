@@ -979,17 +979,18 @@ class SimulatorSession(object):
             'v_corner': 0.30,
             'servo_limit': 1.00,
             'pre_corner_decel': 0.90,
+            'road_turn_steer_gain': 1.40,
             'car_length': 76.0,          # dung chieu dai chu START
             'car_width': 21.0,           # dung chieu rong chu START
-            # Goc be banh vat ly thuc te cua xe khi servo o moc tham chieu ±0.40 (1200-1800 us)
-            'wheel_deg_at_limit': 34.0,
+            # Goc be banh vat ly toi da cua xe tai servo ±1.00 (100% tam lai)
+            'wheel_deg_at_limit': 36.0,
             'speed_px_per_s': 260.0,     # toc do o throttle_out=1.0 (map px/s)
             'latency_frames': 1,         # do tre pipeline (so frame o 30 Hz)
             'glare': 0.0,
             'shadow': 0.0,
             # Pure Pursuit params
-            'pp_lookahead_px': 88.0,
-            'pp_gain': 1.15,
+            'pp_lookahead_px': 78.0,
+            'pp_gain': 1.20,
             'half_lane_px': 82.0,
             # Follow-The-Gap params
             'ftg_gain': 1.25,
@@ -1315,22 +1316,22 @@ class SimulatorSession(object):
             road_logits, center_logits, infer_ms = self._infer_road_and_center(cam_bgr)
             v_str_ui = float(self.params.get('v_straight', fx['v_straight']))
             v_cor_ui = float(self.params.get('v_corner', fx['v_corner']))
-            srv_lim_ui = float(self.params.get('servo_limit', fx['steering_output_max']))
-            drv_steer_gain = float(fx['steering_gain'])
+            srv_lim_ui = float(self.params.get('servo_limit', 1.00))
+            drv_steer_gain = -1.00 if self.controller_name == 'road_pure_pursuit' else float(fx['steering_gain'])
             drv_thr_gain = float(fx['throttle_gain'])
             if self.controller_name == 'road_pure_pursuit':
                 self.pp_ctrl.v_straight = v_str_ui
                 self.pp_ctrl.v_corner = v_cor_ui
-                self.pp_ctrl.v_max = max(float(fx['v_max']), v_str_ui, v_cor_ui)
+                self.pp_ctrl.v_max = max(0.475, float(fx['v_max']), v_str_ui, v_cor_ui)
                 self.pp_ctrl.v_min = min(float(fx['v_min']), v_cor_ui)
+                self.pp_ctrl.drv_steer_gain = drv_steer_gain
                 self.pp_ctrl.drv_out_max = srv_lim_ui
-                if abs(srv_lim_ui - float(fx['steering_output_max'])) > 1e-6:
-                    need_st = min(1.0, srv_lim_ui / max(1e-6, abs(drv_steer_gain)))
-                    self.pp_ctrl.steer_max = need_st
-                    self.pp_ctrl.corner_steer_max = need_st
-                else:
-                    self.pp_ctrl.steer_max = float(fx['steer_max'])
-                    self.pp_ctrl.corner_steer_max = float(fx['steer_max'])
+                self.pp_ctrl.steer_max = min(1.0, srv_lim_ui)
+                self.pp_ctrl.corner_steer_max = min(1.0, srv_lim_ui)
+                self.pp_ctrl.servo_ref_at_limit = 0.72
+                self.pp_ctrl.edge_margin_px = 56.0
+                self.pp_ctrl.edge_push_gain = 0.65
+                self.pp_ctrl.curve_enter = 0.06
                 ctrl_out = self.pp_ctrl.step(road_logits, dt, overrides=self.params)
             else:
                 fx_ui = dict(fx)
@@ -1383,8 +1384,11 @@ class SimulatorSession(object):
             self._cmd_queue.popleft()
         app_servo, app_thr = self._cmd_queue[0]
 
-        # Anh xa servo -> goc banh vat ly theo ti le chuan tai moc ±0.40 cua default.yaml
-        nom_span = max(1e-6, abs(float(fx['steering_output_max'])))
+        # Anh xa servo -> goc banh vat ly:
+        # - road_pure_pursuit dung full tam servo +-1.00 (wheel_deg_at_limit = goc banh o full lock 1.00)
+        # - project_current / road_ftg dung moc chuan default.yaml +-0.40
+        nom_span = (1.0 if self.controller_name == 'road_pure_pursuit'
+                    else max(1e-6, abs(float(fx['steering_output_max']))))
         wheel_at_lim_rad = math.radians(float(self.params['wheel_deg_at_limit']))
         max_mech_rad = math.radians(45.0)
         self.wheel_angle = float(np.clip((app_servo / nom_span) * wheel_at_lim_rad, -max_mech_rad, max_mech_rad))

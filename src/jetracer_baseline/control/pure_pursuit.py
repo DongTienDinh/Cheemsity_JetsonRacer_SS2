@@ -109,6 +109,8 @@ class RoadPurePursuitController(object):
         self.drv_out_max = 0.40
         self.servo_ref_at_limit = 0.39
         self.pre_corner_decel = 0.0
+        self.road_turn_steer_gain = 1.0
+        self.curve_enter = 0.25
         self.lookahead_px = 84.0
         self.pp_gain = 1.15
         self.half_lane_px = 82.0
@@ -175,6 +177,8 @@ class RoadPurePursuitController(object):
         self.drv_out_max = float(c('control.driver.steering_output_max', 0.40))
         self.servo_ref_at_limit = float(c('control.pure_pursuit.servo_ref_at_limit', 0.39))
         self.pre_corner_decel = float(c('control.pre_corner_decel', 0.0))
+        self.road_turn_steer_gain = float(c('control.road_turn_steer_gain', 1.0))
+        self.curve_enter = float(c('control.curve_enter', 0.25))
 
         self.lookahead_px = float(c('control.pure_pursuit.lookahead_px', 84.0))
         self.pp_gain = float(c('control.pure_pursuit.gain', 1.15))
@@ -421,10 +425,25 @@ class RoadPurePursuitController(object):
         self.debug_far_angle = far_angle
         curv_proxy = float(np.clip(far_angle / 0.85, -1.0, 1.0))
 
-        shrink = 0.30 * min(1.0, abs(curv_proxy))
+        # Do goc be cong o doan xa cua truc tam (tu nua sau den ngon path):
+        # tren cua chu U 180 do, ngon truc tam uon ngang >= 35-90 do ngay khi moi chom vao cua!
+        mid_idx = max(0, len(pts) // 2 - 1)
+        tip_dx = pts[-1, 0] - pts[mid_idx, 0]
+        tip_dy = pts[mid_idx, 1] - pts[-1, 1]
+        tip_turn = math.atan2(tip_dx, max(6.0, tip_dy)) if math.hypot(tip_dx, tip_dy) > 8.0 else far_angle
+        same_turn_sign = (far_angle * tip_turn >= 0.0)
+        u_metric = max(abs(curv_proxy), abs(tip_turn) / 1.05 if same_turn_sign else 0.0)
+        # u_level: 0 = duong thang / cua nhe, 1 = cua chu U gat -> danh HET LAI (100% tran servo)
+        u_level = float(np.clip((u_metric - 0.36) / 0.34, 0.0, 1.0))
+        u_sign = 1.0 if (far_angle + 0.5 * tip_turn) >= 0.0 else -1.0
+
+        # Rut ngan tam ngam khi vao cua chu U (an thanh CUA SOM) - KHONG rut qua ngan tren doan thang
+        cua_som = max(0.0, min(1.0, (0.30 - float(self.curve_enter)) / 0.24))
+        max_shrink = 0.28 + 0.12 * cua_som
+        shrink = max_shrink * min(1.0, abs(curv_proxy) * 1.10)
         if self.debug_obstacle_hole:
-            shrink = max(shrink, 0.22)
-        eff_ld = max(48.0, min(total_s, ld_px * (1.0 - shrink)))
+            shrink = max(shrink, 0.24)
+        eff_ld = max(46.0, min(total_s, ld_px * (1.0 - shrink)))
         t_idx = int(np.searchsorted(cum_s, eff_ld))
         t_idx = min(t_idx, len(pts) - 1)
         tx, ty = float(pts[t_idx, 0]), float(pts[t_idx, 1])
@@ -455,31 +474,46 @@ class RoadPurePursuitController(object):
             elif d_l < m_px and d_l + 6.0 < d_r:
                 delta += self.edge_push_gain * ((m_px - d_l) / m_px) * wheel_at_lim_rad
 
-        # Quy doi goc banh vat ly theo moc tham chieu servo 0.39 (== 0.60 * 0.65):
-        # khi mo tran GOC LAI TOI DA len 1.00, doan thang giu nguyen do muot, chi mo
-        # them goc lai khi gap cua chu U gat (delta > wheel_deg_at_limit).
+        # Nguyen ly dua cua chuan:
+        #   - `far_angle` / `u_level` (nhin xa) -> CHI DUNG DE PHANH SOM truoc cua (khong be som cat dao do!).
+        #   - `raw_u` (goc Pure Pursuit tai diem ngam gan) -> khi xe THUC SU vao cua chu U
+        #     (|raw_u| > 0.30), tang luc luy tien theo `LAI CUA GAT` (1.40x) va cam ket
+        #     be toi HET LAI 100% tran servo (+-1.00) de om chat qua cua chu U!
         gain_abs = max(1e-6, abs(self.drv_steer_gain))
         steer_ref = min(steer_span, max(0.10, self.servo_ref_at_limit) / gain_abs)
         raw_u = delta / max(0.15, wheel_at_lim_rad)
+        u_turn_gain = max(1.0, float(ov.get('road_turn_steer_gain', self.road_turn_steer_gain)))
+        # Chi boi lai khi chinh goc Pure Pursuit `|raw_u|` dang vao cua (khong boi tren duong thang!)
+        if u_turn_gain > 1.0 and abs(raw_u) > 0.28:
+            ramp_u = min(1.0, (abs(raw_u) - 0.28) / 0.35)
+            raw_u = raw_u * (1.0 + (u_turn_gain - 1.0) * ramp_u)
+        # Khi xe dang o GIUA cua chu U gat (ca `|raw_u|` lan `u_level` cung cao & cung huong):
+        # day thang toi 100% tran `steer_span` (HET LAI) va tang do nhay EMA de kip om cua!
+        in_u_apex = 0.0
+        if abs(raw_u) > 0.55 and u_level > 0.35 and (raw_u * u_sign > 0.0):
+            in_u_apex = min(1.0, (abs(raw_u) - 0.55) / 0.35) * u_level
         raw_steer = raw_u * steer_ref
+        if in_u_apex > 0.0:
+            full_target = steer_span * (0.80 + 0.20 * in_u_apex)
+            if abs(raw_steer) < full_target:
+                raw_steer = (1.0 if raw_steer >= 0.0 else -1.0) * full_target
         self.steer_wanted = float(raw_steer)
         steer = float(np.clip(raw_steer, -steer_span, steer_span))
         u_norm = float(np.clip(steer / max(1e-6, steer_span), -1.0, 1.0))
-        a = max(0.1, min(1.0, self.steer_smooth))
+        a = max(0.1, min(1.0, self.steer_smooth + 0.20 * in_u_apex))
         steer = a * steer + (1.0 - a) * self._prev_steer
         self._prev_steer = steer
 
-        corner_intensity = max(abs(curv_proxy), min(1.0, abs(raw_u)))
+        corner_intensity = max(abs(curv_proxy), u_level * 0.85, min(1.0, abs(raw_u)))
         if self.debug_obstacle_hole:
             corner_intensity = max(corner_intensity, 0.70)
         self.mode = CORNER if corner_intensity >= 0.26 else STRAIGHT
         target_v = self.v_straight - (self.v_straight - self.v_corner) * min(1.0, corner_intensity * 1.35)
-        # Khi bat GIAM TOC TRUOC CUA (pre_corner_decel > 0) o toc do cua cao (vd 0.30),
-        # ha them ga muot ngay tai dinh cua chu U gat / ne vat can de khong vang mep ngoai.
+        # Phanh truoc & trong dinh cua chu U theo thanh GIAM TOC TRUOC CUA (pre_corner_decel)
         decel = max(0.0, min(1.0, float(ov.get('pre_corner_decel', self.pre_corner_decel))))
-        if decel > 0.0 and corner_intensity > 0.45 and self.v_corner > self.v_min:
-            sharp = min(1.0, (corner_intensity - 0.45) / 0.55)
-            target_v -= (self.v_corner - self.v_min) * (0.45 * decel * sharp)
+        if decel > 0.0 and corner_intensity > 0.38 and self.v_corner > self.v_min:
+            sharp = min(1.0, (corner_intensity - 0.38) / 0.50)
+            target_v -= (self.v_corner - self.v_min) * (0.75 * decel * sharp)
         v_lo = self.v_min if decel > 0.0 else min(self.v_corner, self.v_straight)
         target_v = max(self.v_min, min(self.v_max, max(v_lo, min(self.v_straight, target_v))))
 

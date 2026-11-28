@@ -42,16 +42,17 @@ control:
   steer_max: 1.00
   corner_steer_max: 1.00
   driver:
+    steering_gain: -1.00
     steering_output_min: -1.00
     steering_output_max: 1.00
   pure_pursuit:
-    lookahead_px: 88.0
-    gain: 1.15
+    lookahead_px: 78.0
+    gain: 1.20
     half_lane_px: 82.0
     wheel_deg_at_limit: 34.0
-    servo_ref_at_limit: 0.39
+    servo_ref_at_limit: 0.72
     car_length_px: 76.0
-    edge_margin_px: 54.0
-    edge_push_gain: 0.45
+    edge_margin_px: 56.0
+    edge_push_gain: 0.65
     steer_smooth: 0.72
     max_hole_area: 180
