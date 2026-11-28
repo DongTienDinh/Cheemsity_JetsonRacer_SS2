@@ -3224,13 +3224,21 @@ def test_road_pure_pursuit_controller_and_config():
     from jetracer_baseline.perception.lane_cnn import SEG_H, SEG_W
 
     pp_yaml = os.path.join(ROOT, 'configs', 'road_pure_pursuit.yaml')
+    base_cfg = load_config(CONFIG)
+    # configs/default.yaml goc KHONG bi thay doi
+    assert base_cfg.get('control.driver.steering_output_min') == -0.40
+    assert base_cfg.get('control.driver.steering_output_max') == 0.40
+    assert base_cfg.get('control.v_straight') == 0.30
+    assert base_cfg.get('control.v_corner') == 0.12
+
     cfg = load_config(CONFIG, [pp_yaml])
-    # Khong duoc pha vo cac gioi han co dinh cua default.yaml
-    assert cfg.get('control.driver.steering_output_min') == -0.40
-    assert cfg.get('control.driver.steering_output_max') == 0.40
+    # road_pure_pursuit.yaml chuan hoa dung bo 9 thanh UI chay that tren xe
+    assert cfg.get('control.driver.steering_output_min') == -1.00
+    assert cfg.get('control.driver.steering_output_max') == 1.00
     assert cfg.get('control.driver.steering_gain') == -0.65
-    assert cfg.get('control.v_straight') == 0.30
-    assert cfg.get('control.v_corner') == 0.12
+    assert cfg.get('control.v_straight') == 0.38
+    assert cfg.get('control.v_corner') == 0.30
+    assert cfg.get('control.pre_corner_decel') == 0.90
     assert cfg.get('control.mode') == 'pure_pursuit'
     assert cfg.get('lane.cnn.road_only') is True
 
@@ -3242,7 +3250,7 @@ def test_road_pure_pursuit_controller_and_config():
         out = ctrl.step(seg_str, 1.0 / 30.0)
     assert out['found'] and ctrl.road_start_ready
     assert abs(out['steer']) < 0.08
-    assert abs(out['steer']) <= 0.60 + 1e-6
+    assert abs(out['steer']) <= 1.00 + 1e-6
 
     # 2. Cua sang PHAI o phan tren -> lai duong (re phai) va trong gioi han steer_max
     ctrl.reset()
@@ -3254,7 +3262,7 @@ def test_road_pure_pursuit_controller_and_config():
     for _ in range(5):
         out_r = ctrl.step(seg_r, 1.0 / 30.0)
     assert out_r['found'] and out_r['steer'] > 0.12
-    assert out_r['steer'] <= 0.60 + 1e-6
+    assert out_r['steer'] <= 1.00 + 1e-6
 
     # 3. Vat can tao lo lon ben TRAI mat duong -> giu lo (obstacle_hole=True) va ne sang PHAI
     ctrl.reset()

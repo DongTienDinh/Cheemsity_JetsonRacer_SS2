@@ -974,20 +974,21 @@ class SimulatorSession(object):
 
         self.fixed_default = load_fixed_default_yaml()
         self.params = {
-            # 3 thanh chinh toc do & servo tren giao dien (khoi tao dung tu configs/default.yaml)
-            'v_straight': float(self.fixed_default['v_straight']),
-            'v_corner': float(self.fixed_default['v_corner']),
-            'servo_limit': float(self.fixed_default['steering_output_max']),
+            # Profile da chuan hoa theo 9 thanh UI chay that cua xe (TOC DO 0.38/0.30, SERVO +-1.00, DECEL 0.90)
+            'v_straight': 0.38,
+            'v_corner': 0.30,
+            'servo_limit': 1.00,
+            'pre_corner_decel': 0.90,
             'car_length': 76.0,          # dung chieu dai chu START
             'car_width': 21.0,           # dung chieu rong chu START
-            # Goc be banh vat ly thuc te cua xe khi servo cham tran mac dinh ±0.40 (1200-1800 us) trong default.yaml
+            # Goc be banh vat ly thuc te cua xe khi servo o moc tham chieu ±0.40 (1200-1800 us)
             'wheel_deg_at_limit': 34.0,
             'speed_px_per_s': 260.0,     # toc do o throttle_out=1.0 (map px/s)
             'latency_frames': 1,         # do tre pipeline (so frame o 30 Hz)
             'glare': 0.0,
             'shadow': 0.0,
             # Pure Pursuit params
-            'pp_lookahead_px': 84.0,
+            'pp_lookahead_px': 88.0,
             'pp_gain': 1.15,
             'half_lane_px': 82.0,
             # Follow-The-Gap params
