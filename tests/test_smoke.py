@@ -3291,6 +3291,131 @@ def test_road_pure_pursuit_controller_and_config():
     assert det.last_road_logits is not None and det.last_road_logits.shape == (SEG_H, SEG_W)
 
 
+def test_road_pure_pursuit_all_9_sliders_behavior():
+    """Xac minh 9/9 thanh truot UI deu tac dong that & dung chieu trong RoadPurePursuitController."""
+    from jetracer_baseline.control.pure_pursuit import RoadPurePursuitController
+    from jetracer_baseline.perception.lane_cnn import SEG_H, SEG_W
+
+    pp_yaml = os.path.join(ROOT, 'configs', 'road_pure_pursuit.yaml')
+    dt = 1.0 / 30.0
+
+    # Tao mask duong thang -> cua phai nhe (de kiem tra cua som vs cua muon)
+    seg_str = np.full((SEG_H, SEG_W), -5.0, dtype=np.float32)
+    seg_str[:, 34:94] = 5.0
+
+    seg_bend = np.full((SEG_H, SEG_W), -5.0, dtype=np.float32)
+    for y in range(SEG_H):
+        t = float(SEG_H - 1 - y) / float(SEG_H)
+        # Doan gan mui xe (t < 0.35) van thang, phia xa (t >= 0.35) bat dau cua phai
+        shift = 0.0 if t < 0.35 else 46.0 * ((t - 0.35) / 0.65) ** 1.5
+        cx = int(64 + shift)
+        seg_bend[y, max(0, cx - 28):min(SEG_W, cx + 28)] = 5.0
+
+    seg_bend_l = np.fliplr(seg_bend)
+
+    # 1. CUA SOM (thanh #3): thap = ngam gan & cua muon hon, cao = ngam xa & cua som hon!
+    cfg_late = load_config(CONFIG, [pp_yaml])
+    cfg_late.set('control.curve_enter', 0.30)          # CUA SOM = 0.00
+    cfg_late.set('control.corner_enter_delay_s', 0.0)
+    cfg_late.set('control.curvy_zone_enabled', False)
+    c_late = RoadPurePursuitController(cfg_late)
+
+    cfg_early = load_config(CONFIG, [pp_yaml])
+    cfg_early.set('control.curve_enter', 0.06)         # CUA SOM = 1.00
+    cfg_early.set('control.corner_enter_delay_s', 0.0)
+    cfg_early.set('control.curvy_zone_enabled', False)
+    c_early = RoadPurePursuitController(cfg_early)
+
+    for _ in range(3):
+        o_late = c_late.step(seg_bend, dt)
+        o_early = c_early.step(seg_bend, dt)
+    assert c_early.debug_eff_ld > c_late.debug_eff_ld + 8.0, (
+        'CUA SOM cao phai ngam xa hon: early=%.1f late=%.1f' % (c_early.debug_eff_ld, c_late.debug_eff_ld))
+    assert o_early['steer'] > o_late['steer'], (
+        'CUA SOM cao phai be lai som hon: early=%.3f late=%.3f' % (o_early['steer'], o_late['steer']))
+
+    # 2. TRE VAO CUA (thanh #6): hoan be lai manh o nhip dau vao cua, giam toc ngay
+    cfg_nodel = load_config(CONFIG, [pp_yaml])
+    cfg_nodel.set('control.corner_enter_delay_s', 0.0)
+    cfg_nodel.set('control.curvy_zone_enabled', False)
+    c_nodel = RoadPurePursuitController(cfg_nodel)
+
+    cfg_del = load_config(CONFIG, [pp_yaml])
+    cfg_del.set('control.corner_enter_delay_s', 0.30)
+    cfg_del.set('control.curvy_zone_enabled', False)
+    c_del = RoadPurePursuitController(cfg_del)
+
+    for _ in range(5):
+        c_nodel.step(seg_str, dt)
+        c_del.step(seg_str, dt)
+    o_nd = c_nodel.step(seg_bend, dt)
+    o_dl = c_del.step(seg_bend, dt)
+    assert c_del.corner_delay_active, 'TRE VAO CUA phai kich hoat khi moi vao cua'
+    assert o_dl['steer'] < o_nd['steer'], (
+        'TRE VAO CUA phai giam goc be lai o nhip dau: delay=%.3f nodelay=%.3f' % (o_dl['steer'], o_nd['steer']))
+
+    # 3. NHA LAI RA CUA (thanh #5): giu lai muot khi vua thoat cua & huy ngay khi dao chieu
+    cfg_rel = load_config(CONFIG, [pp_yaml])
+    cfg_rel.set('control.road_turn_release_s', 0.40)
+    cfg_rel.set('control.corner_enter_delay_s', 0.0)
+    cfg_rel.set('control.curvy_zone_enabled', False)
+    c_rel = RoadPurePursuitController(cfg_rel)
+
+    cfg_norel = load_config(CONFIG, [pp_yaml])
+    cfg_norel.set('control.road_turn_release_s', 0.0)
+    cfg_norel.set('control.corner_enter_delay_s', 0.0)
+    cfg_norel.set('control.curvy_zone_enabled', False)
+    c_norel = RoadPurePursuitController(cfg_norel)
+
+    for _ in range(10):
+        c_rel.step(seg_bend, dt)
+        c_norel.step(seg_bend, dt)
+    o_rel_exit = c_rel.step(seg_str, dt)
+    o_norel_exit = c_norel.step(seg_str, dt)
+    assert o_rel_exit['steer'] > o_norel_exit['steer'] + 0.02, (
+        'NHA LAI RA CUA phai nha dan: rel=%.3f norel=%.3f' % (o_rel_exit['steer'], o_norel_exit['steer']))
+    # Dao chieu sang cua trai -> phai huy giu lai cu ngay lap tuc
+    for _ in range(4):
+        o_rev = c_rel.step(seg_bend_l, dt)
+    assert o_rev['steer'] < 0.0
+
+    # 4. NHAY VUNG CUA (thanh #7): tu kich hoat curvy_zone khi cua dao chieu S/U
+    cfg_cz = load_config(CONFIG, [pp_yaml])
+    cfg_cz.set('control.curvy_zone_enabled', True)
+    cfg_cz.set('control.curvy_steer_boost', 1.40)
+    cfg_cz.set('control.corner_enter_delay_s', 0.0)
+    c_cz = RoadPurePursuitController(cfg_cz)
+    for _ in range(6):
+        c_cz.step(seg_bend, dt)
+    for _ in range(6):
+        c_cz.step(seg_bend_l, dt)
+    assert c_cz.curvy_zone, 'NHAY VUNG CUA phai kich hoat curvy_zone khi dao chieu S/U'
+
+    # 5. GIAM TOC TRUOC CUA (thanh #8): decel=1.0 phanh som/manh hon decel=0.0
+    cfg_fast_e = load_config(CONFIG, [pp_yaml])
+    cfg_fast_e.set('control.v_straight', 0.50)
+    cfg_fast_e.set('control.v_corner', 0.25)
+    cfg_fast_e.set('control.v_max', 0.625)
+    cfg_fast_e.set('control.pre_corner_decel', 0.0)
+    c_d0 = RoadPurePursuitController(cfg_fast_e)
+
+    cfg_slow_e = load_config(CONFIG, [pp_yaml])
+    cfg_slow_e.set('control.v_straight', 0.50)
+    cfg_slow_e.set('control.v_corner', 0.25)
+    cfg_slow_e.set('control.v_max', 0.625)
+    cfg_slow_e.set('control.pre_corner_decel', 1.0)
+    c_d1 = RoadPurePursuitController(cfg_slow_e)
+
+    for _ in range(25):
+        c_d0.step(seg_str, dt)
+        c_d1.step(seg_str, dt)
+    for _ in range(8):
+        o_d0 = c_d0.step(seg_bend, dt)
+        o_d1 = c_d1.step(seg_bend, dt)
+    assert o_d1['throttle'] < o_d0['throttle'] - 0.02, (
+        'GIAM TOC TRUOC CUA=1.0 phai ha ga manh hon 0.0: d1=%.3f d0=%.3f' % (o_d1['throttle'], o_d0['throttle']))
+
+
 def test_yaml_fallback_matches_pyyaml_for_all_configs():
     """Bo doc/ghi YAML thuan Python trong config.py phai khop 100% PyYAML."""
     import glob

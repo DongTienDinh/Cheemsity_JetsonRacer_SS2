@@ -109,9 +109,20 @@ class RoadPurePursuitController(object):
         self.drv_out_max = 0.40
         self.servo_ref_at_limit = 0.39
         self.pre_corner_decel = 0.0
+        self.slowdown = 0.12
         self.road_turn_steer_gain = 1.0
-        self.curve_enter = 0.25
-        self.lookahead_px = 84.0
+        self.road_turn_release_s = 0.0
+        self.corner_enter_delay_s = 0.0
+        self.curvy_zone_enabled = False
+        self.curvy_steer_boost = 1.20
+        self.curvy_lookahead_scale = 0.78
+        self.curvy_speed_scale = 0.90
+        self.curvy_window_s = 6.0
+        self.curvy_turn_count = 2
+        self.curvy_exit_straight_s = 1.8
+        self.curve_enter = 0.18
+        self.curve_exit = 0.117
+        self.lookahead_px = 78.0
         self.pp_gain = 1.15
         self.half_lane_px = 82.0
         self.wheel_deg_at_limit = 34.0
@@ -176,11 +187,24 @@ class RoadPurePursuitController(object):
         self.drv_steer_gain = float(c('control.driver.steering_gain', -0.65))
         self.drv_out_max = float(c('control.driver.steering_output_max', 0.40))
         self.servo_ref_at_limit = float(c('control.pure_pursuit.servo_ref_at_limit', 0.39))
-        self.pre_corner_decel = float(c('control.pre_corner_decel', 0.0))
-        self.road_turn_steer_gain = float(c('control.road_turn_steer_gain', 1.0))
-        self.curve_enter = float(c('control.curve_enter', 0.25))
+        self.pre_corner_decel = max(0.0, min(1.0, float(c('control.pre_corner_decel', 0.0))))
+        self.slowdown = max(0.0, float(c('control.slowdown', 0.12)))
+        self.road_turn_steer_gain = max(1.0, float(c('control.road_turn_steer_gain', 1.0)))
+        self.road_turn_release_s = max(0.0, float(c('control.road_turn_release_s', 0.0)))
+        self.corner_enter_delay_s = max(0.0, float(c('control.corner_enter_delay_s', 0.0)))
+        self.curvy_zone_enabled = bool(c('control.curvy_zone_enabled', False))
+        self.curvy_steer_boost = max(1.0, float(c('control.curvy_steer_boost', 1.20)))
+        self.curvy_lookahead_scale = max(0.45, min(1.0, float(c('control.curvy_lookahead_scale', 0.78))))
+        self.curvy_speed_scale = max(0.50, min(1.0, float(c('control.curvy_speed_scale', 0.90))))
+        self.curvy_window_s = max(1.0, float(c('control.curvy_window_s', 6.0)))
+        self.curvy_turn_count = max(1, int(c('control.curvy_turn_count', 2)))
+        self.curvy_exit_straight_s = max(0.3, float(c('control.curvy_exit_straight_s', 1.8)))
+        self.curve_enter = float(c('control.curve_enter', 0.18))
+        self.curve_exit = float(c('control.curve_exit', self.curve_enter * 0.65))
+        if self.curve_exit >= self.curve_enter:
+            self.curve_exit = self.curve_enter * 0.7
 
-        self.lookahead_px = float(c('control.pure_pursuit.lookahead_px', 84.0))
+        self.lookahead_px = float(c('control.pure_pursuit.lookahead_px', 78.0))
         self.pp_gain = float(c('control.pure_pursuit.gain', 1.15))
         self.half_lane_px = float(c('control.pure_pursuit.half_lane_px', 82.0))
         self.wheel_deg_at_limit = float(c('control.pure_pursuit.wheel_deg_at_limit', 34.0))
@@ -202,13 +226,71 @@ class RoadPurePursuitController(object):
         self.steer_limit = self.corner_steer_max
         self.curvy_zone = False
         self.corner_delay_active = False
+        self._elapsed = 0.0
+        self._enter_delay_elapsed = 0.0
+        self._prev_corner_dir = 0
+        self._turn_history = []
+        self._curvy_corner_time = 0.0
+        self._straight_streak = 0.0
+        self._exit_steer = 0.0
+        self._exit_elapsed = 0.0
         self._road_start_streak = 0
         self.debug_bev_pts = []
         self.debug_target = None
         self.debug_road_bev = None
         self._debug_road_fast = None
         self.debug_far_angle = 0.0
+        self.debug_eff_ld = self.lookahead_px
         self.debug_obstacle_hole = False
+
+    def _update_curvy_zone(self, mode, turn_dir, entered_turn, reversed_turn, dt):
+        if not self.curvy_zone_enabled:
+            self.curvy_zone = False
+            return
+        self._elapsed += dt
+        cutoff = self._elapsed - self.curvy_window_s
+        self._turn_history = [(t, d) for (t, d) in self._turn_history if t >= cutoff]
+        if mode == CORNER:
+            self._straight_streak = 0.0
+            self._curvy_corner_time = min(4.0, self._curvy_corner_time + dt)
+            if (entered_turn or reversed_turn) and turn_dir != 0:
+                if (not self._turn_history or
+                        self._turn_history[-1][1] != turn_dir or
+                        (self._elapsed - self._turn_history[-1][0]) >= 0.35):
+                    self._turn_history.append((self._elapsed, turn_dir))
+            dirs = set(d for (_t, d) in self._turn_history if d != 0)
+            if (len(dirs) >= 2 or
+                    len(self._turn_history) >= self.curvy_turn_count or
+                    self._curvy_corner_time >= 1.6):
+                self.curvy_zone = True
+        else:
+            self._straight_streak += dt
+            self._curvy_corner_time = max(0.0, self._curvy_corner_time - 0.5 * dt)
+            if self._straight_streak >= self.curvy_exit_straight_s:
+                self.curvy_zone = False
+                self._turn_history = []
+
+    def _steer_at_exit(self, steer, limit, in_sharp_turn, dt):
+        duration = self.road_turn_release_s
+        if self.curvy_zone_enabled and self.curvy_zone:
+            duration *= 0.40
+        if duration <= 0.0:
+            self._exit_steer = 0.0
+            return steer
+        if in_sharp_turn:
+            self._exit_steer = max(-limit, min(limit, steer))
+            self._exit_elapsed = 0.0
+            return steer
+        if self._exit_steer == 0.0:
+            return steer
+        self._exit_elapsed += dt
+        if steer * self._exit_steer < 0.0 or self._exit_elapsed >= duration:
+            self._exit_steer = 0.0
+            return steer
+        if abs(steer) < abs(self._exit_steer):
+            remaining = 1.0 - self._exit_elapsed / duration
+            steer += (self._exit_steer - steer) * remaining
+        return steer
 
     @property
     def road_start_ready(self):
@@ -437,13 +519,81 @@ class RoadPurePursuitController(object):
         u_level = float(np.clip((u_metric - 0.36) / 0.34, 0.0, 1.0))
         u_sign = 1.0 if (far_angle + 0.5 * tip_turn) >= 0.0 else -1.0
 
-        # Rut ngan tam ngam khi vao cua chu U (an thanh CUA SOM) - KHONG rut qua ngan tren doan thang
-        cua_som = max(0.0, min(1.0, (0.30 - float(self.curve_enter)) / 0.24))
-        max_shrink = 0.28 + 0.12 * cua_som
-        shrink = max_shrink * min(1.0, abs(curv_proxy) * 1.10)
+        # Do khoang cach mep gan mui xe o 160x120 (dung ca cho an toan tre vao cua & dem day mep)
+        d_l, d_r = 999.0, 999.0
+        if dist_fast is not None and self.edge_margin_px > 0.0:
+            half_f = BEV_W // 2
+            left_out = outside_fast[BEV_H - 21:BEV_H - 3, :half_f]
+            right_out = outside_fast[BEV_H - 21:BEV_H - 3, half_f:]
+            has_l = left_out.any(axis=1)
+            has_r = right_out.any(axis=1)
+            if has_l.any():
+                d_l = float(np.median(left_out[has_l, ::-1].argmax(axis=1) + 1)) * inv_scale
+            if has_r.any():
+                d_r = float(np.median(right_out[has_r].argmax(axis=1) + 1)) * inv_scale
+
+        # Xac dinh trang thai THANG / CUA + vung nhieu cua + do tre vao cua (TRE VAO CUA)
+        prev_mode = self.mode
+        enter_thr = max(0.14, min(0.30, float(self.curve_enter)))
+        exit_thr = max(0.08, enter_thr * 0.65)
+        pre_corner_mag = max(abs(curv_proxy), u_level * 0.85)
         if self.debug_obstacle_hole:
-            shrink = max(shrink, 0.24)
-        eff_ld = max(46.0, min(total_s, ld_px * (1.0 - shrink)))
+            pre_corner_mag = max(pre_corner_mag, 0.70)
+        if prev_mode == STRAIGHT:
+            next_mode = CORNER if pre_corner_mag >= enter_thr else STRAIGHT
+        else:
+            next_mode = STRAIGHT if pre_corner_mag <= exit_thr else CORNER
+        self.mode = next_mode
+
+        turn_dir = (1 if (far_angle + 0.5 * tip_turn) > 0.0 else -1) if pre_corner_mag >= 0.12 else 0
+        entered_turn = (prev_mode == STRAIGHT and self.mode == CORNER)
+        reversed_turn = (self.mode == CORNER and self._prev_corner_dir != 0 and
+                         turn_dir != 0 and turn_dir != self._prev_corner_dir)
+        self._update_curvy_zone(self.mode, turn_dir, entered_turn, reversed_turn, dt)
+
+        # TRE VAO CUA (corner_enter_delay_s): giam ga NGAY nhung hoan be lai manh
+        # va giu diem ngam sat mui xe them 1 nhip de xe di sau vao cua, tranh cua som!
+        self.corner_delay_active = False
+        delay_s = max(0.0, float(ov.get('corner_enter_delay_s', self.corner_enter_delay_s)))
+        if self.curvy_zone_enabled and self.curvy_zone and delay_s > 0.0:
+            delay_s *= 0.75
+        cte_near = float(np.clip((pts[0, 0] - PROC_W * 0.5) / (PROC_W * 0.5), -1.0, 1.0))
+        if self.mode == CORNER:
+            if entered_turn or reversed_turn:
+                self._enter_delay_elapsed = 0.0
+            if turn_dir != 0:
+                self._prev_corner_dir = turn_dir
+            if delay_s > 0.0:
+                self._enter_delay_elapsed += dt
+                # Bo qua tre ngay khi phai ne vat can hoac mui xe ap sat MOT ben mep (an toan)
+                edge_danger = (min(d_l, d_r) < 24.0 and abs(d_l - d_r) > 14.0)
+                if (self.debug_obstacle_hole or edge_danger
+                        or abs(cte_near) >= 0.35 or abs(curv_proxy) >= 0.68):
+                    self._enter_delay_elapsed = delay_s
+                delay_alpha = min(1.0, self._enter_delay_elapsed / delay_s)
+                self.corner_delay_active = (delay_alpha < 1.0 - 1e-6)
+            else:
+                delay_alpha = 1.0
+        else:
+            self._enter_delay_elapsed = 0.0
+            self._prev_corner_dir = 0
+            delay_alpha = 1.0
+
+        # CUA SOM (0..1) DUNG CHIEU hinh hoc Pure Pursuit:
+        #   - CUA SOM thap (0.0) -> ngam GAN mui xe (0.72x ld_px) -> di sau vao cua, chong cua som!
+        #   - CUA SOM cao  (1.0) -> ngam XA hon    (1.12x ld_px) -> vao cua som hon!
+        cua_som = max(0.0, min(1.0, (0.30 - float(self.curve_enter)) / 0.24))
+        ld_base = ld_px * (0.72 + 0.40 * cua_som)
+        shrink = 0.26 * min(1.0, abs(curv_proxy) * 1.10)
+        if self.debug_obstacle_hole:
+            shrink = max(shrink, 0.22)
+        eff_ld = ld_base * (1.0 - shrink)
+        if self.curvy_zone_enabled and self.curvy_zone and not self.debug_obstacle_hole:
+            eff_ld *= self.curvy_lookahead_scale
+        if self.corner_delay_active:
+            eff_ld *= (0.78 + 0.22 * delay_alpha)
+        eff_ld = max(42.0, min(total_s, eff_ld))
+        self.debug_eff_ld = eff_ld
         t_idx = int(np.searchsorted(cum_s, eff_ld))
         t_idx = min(t_idx, len(pts) - 1)
         tx, ty = float(pts[t_idx, 0]), float(pts[t_idx, 1])
@@ -459,49 +609,46 @@ class RoadPurePursuitController(object):
 
         # Dem day mep gan mui xe o 160x120
         if dist_fast is not None and self.edge_margin_px > 0.0 and self.edge_push_gain > 0.0:
-            half_f = BEV_W // 2
-            left_out = outside_fast[BEV_H - 21:BEV_H - 3, :half_f]
-            right_out = outside_fast[BEV_H - 21:BEV_H - 3, half_f:]
-            has_l = left_out.any(axis=1)
-            has_r = right_out.any(axis=1)
-            d_l = (float(np.median(left_out[has_l, ::-1].argmax(axis=1) + 1)) * inv_scale
-                   if has_l.any() else 999.0)
-            d_r = (float(np.median(right_out[has_r].argmax(axis=1) + 1)) * inv_scale
-                   if has_r.any() else 999.0)
             m_px = self.edge_margin_px
             if d_r < m_px and d_r + 6.0 < d_l:
                 delta -= self.edge_push_gain * ((m_px - d_r) / m_px) * wheel_at_lim_rad
             elif d_l < m_px and d_l + 6.0 < d_r:
                 delta += self.edge_push_gain * ((m_px - d_l) / m_px) * wheel_at_lim_rad
 
-        # Nguyen ly dua cua chuan:
-        #   - `far_angle` / `u_level` (nhin xa) -> CHI DUNG DE PHANH SOM truoc cua (khong be som cat dao do!).
-        #   - `raw_u` (goc Pure Pursuit tai diem ngam gan) -> khi xe THUC SU vao cua chu U
-        #     (|raw_u| > 0.30), tang luc luy tien theo `LAI CUA GAT` (1.40x) va cam ket
-        #     be toi HET LAI 100% tran servo (+-1.00) de om chat qua cua chu U!
+        # Nguyen ly cua khong cat som + full-lock trong dinh cua chu U:
+        #   - Tren doan thang / moi vao cua: giu do nhay goc vua phai (`servo_ref_at_limit`)
+        #     + hoan boi lai theo `TRE VAO CUA` (`delay_alpha`) de khong cua som.
+        #   - Khi xe THUC SU vao cua gat (|raw_u| > 0.36): tang luc theo `LAI CUA GAT`,
+        #     `NHAY VUNG CUA` va cam ket full-lock 100% tran servo trong dinh chu U!
         gain_abs = max(1e-6, abs(self.drv_steer_gain))
         steer_ref = min(steer_span, max(0.10, self.servo_ref_at_limit) / gain_abs)
         raw_u = delta / max(0.15, wheel_at_lim_rad)
+        if self.debug_obstacle_hole:
+            raw_u = raw_u * 1.32
         u_turn_gain = max(1.0, float(ov.get('road_turn_steer_gain', self.road_turn_steer_gain)))
-        # Chi boi lai khi chinh goc Pure Pursuit `|raw_u|` dang vao cua (khong boi tren duong thang!)
-        if u_turn_gain > 1.0 and abs(raw_u) > 0.28:
-            ramp_u = min(1.0, (abs(raw_u) - 0.28) / 0.35)
-            raw_u = raw_u * (1.0 + (u_turn_gain - 1.0) * ramp_u)
-        # Khi xe dang o GIUA cua chu U gat (ca `|raw_u|` lan `u_level` cung cao & cung huong):
-        # day thang toi 100% tran `steer_span` (HET LAI). Keo `LAI CUA GAT` len 1.5..2.0
-        # se vao full-lock som & dut khoat hon nua!
+        eff_turn_gain = 1.0 + (u_turn_gain - 1.0) * delay_alpha
+        if eff_turn_gain > 1.0 and abs(raw_u) > 0.36:
+            ramp_u = min(1.0, (abs(raw_u) - 0.36) / 0.36)
+            raw_u = raw_u * (1.0 + (eff_turn_gain - 1.0) * ramp_u)
+        if self.curvy_zone_enabled and self.curvy_zone and self.mode == CORNER and self.curvy_steer_boost > 1.0:
+            c_boost = 1.0 + (self.curvy_steer_boost - 1.0) * delay_alpha
+            raw_u = raw_u * c_boost
+
         in_u_apex = 0.0
-        apex_thr = max(0.32, 0.55 - 0.30 * max(0.0, u_turn_gain - 1.40))
-        if abs(raw_u) > apex_thr and u_level > 0.30 and (raw_u * u_sign > 0.0):
-            in_u_apex = min(1.0, (abs(raw_u) - apex_thr) / 0.32) * u_level
+        apex_thr = max(0.38, 0.58 - 0.25 * max(0.0, u_turn_gain - 1.40))
+        if abs(raw_u) > apex_thr and u_level > 0.32 and (raw_u * u_sign > 0.0):
+            in_u_apex = min(1.0, (abs(raw_u) - apex_thr) / 0.30) * u_level * delay_alpha
         raw_steer = raw_u * steer_ref
         if in_u_apex > 0.0:
             full_target = steer_span * min(1.0, 0.80 + 0.20 * in_u_apex + 0.20 * max(0.0, u_turn_gain - 1.40))
             if abs(raw_steer) < full_target:
                 raw_steer = (1.0 if raw_steer >= 0.0 else -1.0) * full_target
+        # NHA LAI RA CUA (road_turn_release_s): giu lai muot khi vua thoat cua,
+        # huy ngay lap tuc neu xe dao chieu lai sang cua tiep theo.
+        in_sharp_turn = (self.mode == CORNER and abs(raw_steer) >= 0.08)
+        raw_steer = self._steer_at_exit(raw_steer, steer_span, in_sharp_turn, dt)
         self.steer_wanted = float(raw_steer)
         steer = float(np.clip(raw_steer, -steer_span, steer_span))
-        u_norm = float(np.clip(steer / max(1e-6, steer_span), -1.0, 1.0))
         a = max(0.1, min(1.0, self.steer_smooth + 0.20 * in_u_apex))
         steer = a * steer + (1.0 - a) * self._prev_steer
         self._prev_steer = steer
@@ -509,22 +656,28 @@ class RoadPurePursuitController(object):
         corner_intensity = max(abs(curv_proxy), u_level * 0.85, min(1.0, abs(raw_u)))
         if self.debug_obstacle_hole:
             corner_intensity = max(corner_intensity, 0.70)
-        self.mode = CORNER if corner_intensity >= 0.26 else STRAIGHT
-        target_v = self.v_straight - (self.v_straight - self.v_corner) * min(1.0, corner_intensity * 1.35)
-        # Phanh truoc & trong dinh cua chu U theo thanh GIAM TOC TRUOC CUA (pre_corner_decel)
+        if corner_intensity >= enter_thr:
+            self.mode = CORNER
+        # GIAM TOC TRUOC CUA (pre_corner_decel) + ha ga theo lech (slowdown)
         decel = max(0.0, min(1.0, float(ov.get('pre_corner_decel', self.pre_corner_decel))))
+        approach_gain = 0.85 + 1.15 * decel
+        target_v = self.v_straight - (self.v_straight - self.v_corner) * min(1.0, corner_intensity * approach_gain)
         if decel > 0.0 and corner_intensity > 0.38 and self.v_corner > self.v_min:
             sharp = min(1.0, (corner_intensity - 0.38) / 0.50)
             target_v -= (self.v_corner - self.v_min) * (0.75 * decel * sharp)
-        v_lo = self.v_min if decel > 0.0 else min(self.v_corner, self.v_straight)
+        if self.curvy_zone_enabled and self.curvy_zone:
+            target_v *= self.curvy_speed_scale
+        target_v -= self.slowdown * abs(cte_near) * 0.5
+        v_lo = self.v_min if (decel > 0.0 or self.slowdown > 0.0) else min(self.v_corner, self.v_straight)
         target_v = max(self.v_min, min(self.v_max, max(v_lo, min(self.v_straight, target_v))))
 
-        rate = self.throttle_rise_rate if target_v > self._throttle else self.throttle_fall_rate
+        fall_rate = self.throttle_fall_rate * (0.60 + 0.80 * decel)
+        rate = self.throttle_rise_rate if target_v > self._throttle else fall_rate
         dv = target_v - self._throttle
         self._throttle += max(-rate * dt, min(rate * dt, dv))
         self._throttle = max(0.0, min(self.v_max, self._throttle))
 
-        cte = float(np.clip((pts[0, 0] - PROC_W * 0.5) / (PROC_W * 0.5), -1.0, 1.0))
+        cte = cte_near
         look = float(np.clip((tx - PROC_W * 0.5) / (PROC_W * 0.5), -1.0, 1.0))
         return {
             'found': True,

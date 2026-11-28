@@ -534,8 +534,10 @@ class LaneTuningEngine(object):
             result['waiting_for_path'] = self._waiting_for_path
             result['road_turn'] = 0 if use_pp else self.lane.last_road_turn
             result['used_fallback'] = False if use_pp else self.lane.last_used_fallback
-            result['curvy_zone'] = False if use_pp else self.corner.curvy_zone
-            result['corner_delay_active'] = False if use_pp else self.corner.corner_delay_active
+            result['curvy_zone'] = (
+                self.pure_pursuit.curvy_zone if use_pp else self.corner.curvy_zone)
+            result['corner_delay_active'] = (
+                self.pure_pursuit.corner_delay_active if use_pp else self.corner.corner_delay_active)
             if use_pp:
                 result['obstacle_hole'] = bool(self.pure_pursuit.debug_obstacle_hole)
                 if copy_preview:
@@ -594,6 +596,10 @@ class LaneTuningEngine(object):
                     tag_txt, tag_col = 'PURE PURSUIT (CHI CH0)', (60, 235, 60)
                 else:
                     tag_txt, tag_col = 'MAT MAT DUONG CH0', (60, 60, 255)
+                if result.get('curvy_zone'):
+                    tag_txt += ' | VUNG CUA'
+                if result.get('corner_delay_active'):
+                    tag_txt += ' | TRE'
             else:
                 _label(overlay, 'MAT DUONG (XANH) + TAM (VANG)')
                 turn = result.get('road_turn', 0)
@@ -2462,13 +2468,24 @@ class LaneTuningUI(object):
                 % (gp('control.v_corner', 0),
                    100.0 * float(gp('control.v_corner', 0))
                    / max(float(gp('control.v_straight', 1)), 1e-6)))
-            notes['cua_som'].value = _n(
-                'vao cua khi do cong &ge; <b>%.2f</b> &nbsp;|&nbsp; be lai som '
-                '<b>%.2f</b>' % (gp('control.curve_enter', 0),
-                                 gp('control.curve_feedforward', 0)))
-            notes['lai_cua_gat'].value = _n(
-                'nhan lai <b>%.2fx</b> khi mep xanh va diem ngam cung huong'
-                % gp('control.road_turn_steer_gain', 1.0))
+            is_pp = (getattr(self.engine, 'control_mode', 'corner') == 'pure_pursuit')
+            if is_pp:
+                cs = self._cfg_to_cua_som(gp('control.curve_enter', 0.18))
+                ld_now = float(gp('control.pure_pursuit.lookahead_px', 78.0)) * (0.72 + 0.40 * cs)
+                notes['cua_som'].value = _n(
+                    'tam ngam <b>%.0f px</b> (thap = ngam gan, chong cua som | cao = vao cua som)'
+                    % ld_now)
+                notes['lai_cua_gat'].value = _n(
+                    'nhan lai <b>%.2fx</b> trong dinh cua chu U (max 2.00 = het lai nhanh nhat)'
+                    % gp('control.road_turn_steer_gain', 1.0))
+            else:
+                notes['cua_som'].value = _n(
+                    'vao cua khi do cong &ge; <b>%.2f</b> &nbsp;|&nbsp; be lai som '
+                    '<b>%.2f</b>' % (gp('control.curve_enter', 0),
+                                     gp('control.curve_feedforward', 0)))
+                notes['lai_cua_gat'].value = _n(
+                    'nhan lai <b>%.2fx</b> khi mep xanh va diem ngam cung huong'
+                    % gp('control.road_turn_steer_gain', 1.0))
             notes['nha_lai'].value = _n('thoi gian nha lai dan sau cua gat')
             notes['tre_cua'].value = _n(
                 'hoan khuếch dai lai <b>%.2f s</b> khi bat dau vao cua (giam toc ngay, tranh cat som chu U)'

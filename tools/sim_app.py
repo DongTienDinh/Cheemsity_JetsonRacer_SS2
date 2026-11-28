@@ -990,8 +990,9 @@ class SimulatorSession(object):
             'shadow': 0.0,
             # Pure Pursuit params
             'pp_lookahead_px': 78.0,
-            'pp_gain': 1.20,
+            'pp_gain': 1.15,
             'half_lane_px': 82.0,
+            'corner_enter_delay_s': 0.14,
             # Follow-The-Gap params
             'ftg_gain': 1.25,
             'ftg_bubble': 5,
@@ -1329,10 +1330,16 @@ class SimulatorSession(object):
                 self.pp_ctrl.drv_out_max = srv_lim_ui
                 self.pp_ctrl.steer_max = min(1.0, srv_lim_ui)
                 self.pp_ctrl.corner_steer_max = min(1.0, srv_lim_ui)
-                self.pp_ctrl.servo_ref_at_limit = 0.72
+                self.pp_ctrl.servo_ref_at_limit = 0.56
                 self.pp_ctrl.edge_margin_px = 56.0
                 self.pp_ctrl.edge_push_gain = 0.65
-                self.pp_ctrl.curve_enter = 0.06
+                self.pp_ctrl.curve_enter = 0.18
+                self.pp_ctrl.curve_exit = 0.117
+                self.pp_ctrl.corner_enter_delay_s = float(self.params.get('corner_enter_delay_s', 0.14))
+                self.pp_ctrl.curvy_zone_enabled = True
+                self.pp_ctrl.curvy_steer_boost = 1.15
+                self.pp_ctrl.curvy_lookahead_scale = 0.85
+                self.pp_ctrl.curvy_speed_scale = 0.90
                 ctrl_out = self.pp_ctrl.step(road_logits, dt, overrides=self.params)
             else:
                 fx_ui = dict(fx)
