@@ -112,10 +112,9 @@ def build_one_engine(trtexec, onnx_rel, engine_rel, workspace_mb, force):
         print('  [LOI] Khong tim thay file ONNX: %s' % onnx_rel)
         return False
 
-    if (not force and os.path.isfile(engine_path)
-            and os.path.getmtime(engine_path) >= os.path.getmtime(onnx_path)):
+    if not force and os.path.isfile(engine_path) and os.path.getsize(engine_path) > 0:
         size_kb = os.path.getsize(engine_path) / 1024.0
-        print('  [BO QUA] %s da ton tai va moi hon ONNX (%.1f KB). '
+        print('  [BO QUA] %s da co san (%.1f KB). '
               'Dung --force de build lai.' % (engine_rel, size_kb))
         return True
 

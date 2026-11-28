@@ -58,8 +58,12 @@ checkpoints/
 # SU chay tren xe - phai truy nguoc duoc ve dung commit, va de Jetson lay bang
 # `git pull` thay vi scp. Dong phu dinh phai nam SAU `*.onnx` o tren thi moi
 # thang (gitignore lay quy tac khop CUOI CUNG).
-# `.engine` van bi chan: no gan chat thiet bi, chep sang may khac la vo dung.
 !models/*.onnx
+# Engine FP16 pre-built cho Jetson Nano (JetPack 4.5.1 / TRT 7.1.3, ~870 KB)
+# de pull sang xe Nano khac chay ngay 0 giay cho. Neu khac ban TRT, lane_cnn.py
+# tu dong build lai tu file .onnx di kem.
+!models/lane_road_only_fast.engine
+!models/lane_road_only_resse.engine
 *.tflite
 *.torchscript
 
