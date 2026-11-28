@@ -70,31 +70,38 @@ def find_trtexec():
 
 
 def check_python_env():
-    print('=== BUOC 1: KIEM TRA MOI TRUONG PYTHON ===')
+    print('=== BUOC 1: KIEM TRA MOI TRUONG PYTHON (ZERO-INSTALL) ===')
     print('Python :', sys.version.split()[0])
     ok_all = True
     checks = [
         ('cv2', 'OpenCV (co san trong JetPack, KHONG pip install de)', True),
         ('numpy', 'NumPy (co san trong JetPack)', True),
-        ('yaml', 'PyYAML -> cai bang: pip3 install --user PyYAML', True),
         ('tensorrt', 'TensorRT (co san theo JetPack 4.5.1)', True),
-        ('pycuda.driver',
-         'PyCUDA -> cai dung cach (KHONG sudo):\n'
-         '    export PATH=/usr/local/cuda/bin:$PATH\n'
-         '    export CPATH=/usr/local/cuda/include:$CPATH\n'
-         '    export LIBRARY_PATH=/usr/local/cuda/lib64:$LIBRARY_PATH\n'
-         '    pip3 install --user --no-cache-dir pycuda', True),
+        ('yaml', 'Khong bat buoc — da co bo doc YAML thuan Python trong config.py', False),
+        ('pycuda.driver', 'Khong bat buoc — da co fallback libcudart.so (ctypes co san trong JetPack)', False),
         ('ipywidgets', 'ipywidgets (de mo giao dien Speed Track trong JupyterLab)', False),
     ]
+    has_pycuda = False
     for mod, hint, required in checks:
         try:
             __import__(mod)
             print('  [ OK ] %s' % mod)
+            if mod == 'pycuda.driver':
+                has_pycuda = True
         except ImportError as exc:
-            tag = 'THIEU' if required else 'CANH BAO'
+            tag = 'THIEU' if required else 'TU DONG FALLBACK'
             print('  [%s] %s (%s)\n         %s' % (tag, mod, exc, hint))
             if required:
                 ok_all = False
+    if not has_pycuda:
+        sys.path.insert(0, os.path.join(ROOT, 'src'))
+        try:
+            from jetracer_baseline.perception.lane_cnn import _CudartRuntime
+            _CudartRuntime()
+            print('  [ OK ] libcudart.so (ctypes fallback -> chay TensorRT KHONG can cai pycuda!)')
+        except Exception as exc:
+            print('  [THIEU] Ca pycuda lan libcudart.so deu khong nap duoc: %s' % exc)
+            ok_all = False
     return ok_all
 
 
@@ -220,14 +227,11 @@ def main():
     print('\n=== HOAN TAT ===')
     if all_ok:
         print('San sang chay Speed Track! Cac buoc tiep theo:')
-        print('  1. Do latency & kiem tra dau CTE (day xe sang trai -> cte duong):')
-        print('       python3 tools/bench_lane_cnn.py --override configs/cnn_option_b_fast.yaml')
-        print('       python3 tools/bench_lane_cnn.py --override configs/cnn_option_b_fast.yaml --watch --source csi')
-        print('  2. Mo giao dien JupyterLab (tune_lane.ipynb):')
+        print('  1. Mo giao dien JupyterLab (tune_lane.ipynb — mac dinh pp_fast):')
         print('       jupyter lab --ip=0.0.0.0 --no-browser')
-        print('  3. Hoac chay thang bang CLI (khong ton CPU ve UI -> FPS cao nhat):')
+        print('  2. Hoac chay thang bang CLI (khong ton CPU ve UI -> FPS cao nhat):')
         print('       python3 -m src.jetracer_baseline.cli run --task speed --driver nvidia '
-              '--override configs/cnn_option_b_fast.yaml --record')
+              '--override configs/road_pure_pursuit.yaml --record')
         return 0
     print('Co buoc bi loi - xem chi tiet o tren.')
     return 1

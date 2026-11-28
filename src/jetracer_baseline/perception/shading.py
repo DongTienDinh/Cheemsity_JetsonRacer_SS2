@@ -36,7 +36,8 @@ import threading
 
 import cv2
 import numpy as np
-import yaml
+
+from ..config import yaml_safe_load
 
 
 class ShadingCorrector(object):
@@ -87,7 +88,7 @@ class ShadingCorrector(object):
                     'hieu chuan (%s). Chay tools/calib_shading.py truoc, hoac '
                     'dat enabled: false.' % path)
             with io.open(path, 'r', encoding='utf-8') as fh:
-                data = yaml.safe_load(fh) or {}
+                data = yaml_safe_load(fh) or {}
             coeff_r = data.get('coeff_r')
             coeff_b = data.get('coeff_b')
             if coeff_r is None or coeff_b is None:
@@ -99,7 +100,7 @@ class ShadingCorrector(object):
     @classmethod
     def from_file(cls, path):
         with io.open(path, 'r', encoding='utf-8') as fh:
-            data = yaml.safe_load(fh) or {}
+            data = yaml_safe_load(fh) or {}
         return cls(data['coeff_r'], data['coeff_b'],
                    enabled=bool(data.get('enabled', True)),
                    max_gain=float(data.get('max_gain', 3.0)))

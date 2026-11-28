@@ -3291,6 +3291,220 @@ def test_road_pure_pursuit_controller_and_config():
     assert det.last_road_logits is not None and det.last_road_logits.shape == (SEG_H, SEG_W)
 
 
+def test_yaml_fallback_matches_pyyaml_for_all_configs():
+    """Bo doc/ghi YAML thuan Python trong config.py phai khop 100% PyYAML."""
+    import glob
+    from jetracer_baseline.config import _fallback_yaml_dump, _fallback_yaml_load
+
+    try:
+        import yaml as pyyaml
+    except ImportError:
+        pyyaml = None
+
+    cfg_files = sorted(glob.glob(os.path.join(ROOT, 'configs', '*.yaml')))
+    assert cfg_files, 'Khong tim thay file YAML trong configs/'
+    for path in cfg_files:
+        with io.open(path, 'r', encoding='utf-8') as fh:
+            text = fh.read()
+        parsed = _fallback_yaml_load(text)
+        assert isinstance(parsed, dict), path
+        if pyyaml is not None:
+            expected = pyyaml.safe_load(text)
+            assert parsed == expected, 'Lech YAML fallback tai %s' % path
+        dumped = _fallback_yaml_dump(parsed)
+        assert _fallback_yaml_load(dumped) == parsed, 'Lech round-trip tai %s' % path
+
+    # Kiem tra them dict rong, hex, list long nhau, comment ben ngoai chuoi
+    sample = {
+        'empty': {},
+        'nested': {'pts': [[0.1, 1.0], [0.9, 1.0]], 'addr': 64, 'flag': False, 'none_v': None},
+    }
+    assert _fallback_yaml_load(_fallback_yaml_dump(sample)) == sample
+
+
+def test_tensorrt_engine_cudart_ctypes_fallback_without_pycuda():
+    """TensorRTEngine phai chay + auto-build + close OK qua libcudart khi thieu pycuda."""
+    import ctypes
+    from jetracer_baseline.perception import lane_cnn
+
+    class _WrapFn(object):
+        def __init__(self, fn):
+            self._fn = fn
+            self.argtypes = None
+            self.restype = None
+
+        def __call__(self, *args):
+            return self._fn(*args)
+
+    class _FakeCudartLib(object):
+        def __init__(self):
+            self.allocs = {}
+            self.next_ptr = 0x1000
+            self.freed = []
+            self.streams_created = []
+            self.streams_destroyed = []
+            self.syncs = 0
+            self.set_dev_calls = []
+            self.cudaSetDevice = _WrapFn(self._set_device)
+            self.cudaMalloc = _WrapFn(self._malloc)
+            self.cudaFree = _WrapFn(self._free)
+            self.cudaStreamCreate = _WrapFn(self._stream_create)
+            self.cudaStreamDestroy = _WrapFn(self._stream_destroy)
+            self.cudaStreamSynchronize = _WrapFn(self._stream_sync)
+            self.cudaMemcpyAsync = _WrapFn(self._memcpy_async)
+
+        def _set_device(self, dev):
+            self.set_dev_calls.append(dev)
+            return 0
+
+        def _malloc(self, ptr_ref, nbytes):
+            addr = self.next_ptr
+            self.next_ptr += 0x1000
+            self.allocs[addr] = bytearray(int(nbytes))
+            ptr_ref._obj.value = addr
+            return 0
+
+        def _free(self, ptr):
+            val = int(ptr.value or 0)
+            self.freed.append(val)
+            self.allocs.pop(val, None)
+            return 0
+
+        def _stream_create(self, stream_ref):
+            handle = 0x9000 + len(self.streams_created)
+            self.streams_created.append(handle)
+            stream_ref._obj.value = handle
+            return 0
+
+        def _stream_destroy(self, stream):
+            self.streams_destroyed.append(int(stream.value or 0))
+            return 0
+
+        def _stream_sync(self, _stream):
+            self.syncs += 1
+            return 0
+
+        def _memcpy_async(self, dst, src, nbytes, kind, _stream):
+            n = int(nbytes)
+            if kind == lane_cnn._CudartRuntime.HTOD:
+                buf = ctypes.string_at(int(src.value), n)
+                self.allocs[int(dst.value)][:] = buf
+            elif kind == lane_cnn._CudartRuntime.DTOH:
+                buf = bytes(self.allocs[int(src.value)][:n])
+                ctypes.memmove(int(dst.value), buf, n)
+            return 0
+
+    fake_lib = _FakeCudartLib()
+
+    class _FakeExecCtx(object):
+        def __init__(self):
+            self.calls = 0
+
+        def execute_async_v2(self, bindings, stream_handle):
+            self.calls += 1
+            assert stream_handle == fake_lib.streams_created[0]
+            # Doc input tu GPU buffer 0, nhan 2.0 + 1.0 roi ghi vao GPU buffer 1
+            inp = np.frombuffer(bytes(fake_lib.allocs[bindings[0]]), dtype=np.float32)
+            out = (inp[:4] * 2.0 + 1.0).astype(np.float32)
+            fake_lib.allocs[bindings[1]][:] = out.tobytes()
+            return True
+
+    class _FakeCudaEngine(object):
+        num_bindings = 2
+
+        def get_binding_name(self, idx):
+            return 'input' if idx == 0 else 'seg'
+
+        def get_binding_shape(self, idx):
+            return (1, 1, 2, 2) if idx == 0 else (1, 1, 2, 2)
+
+        def get_binding_dtype(self, _idx):
+            return 'float32'
+
+        def binding_is_input(self, idx):
+            return idx == 0
+
+        def create_execution_context(self):
+            return _FakeExecCtx()
+
+    fake_trt = types.ModuleType('tensorrt')
+
+    class _FakeLogger(object):
+        WARNING = 1
+
+        def __init__(self, _lvl):
+            pass
+
+    class _FakeRuntime(object):
+        def __init__(self, _logger):
+            pass
+
+        def deserialize_cuda_engine(self, raw):
+            return _FakeCudaEngine() if raw == b'VALID_ENGINE' else None
+
+    fake_trt.Logger = _FakeLogger
+    fake_trt.Runtime = _FakeRuntime
+    fake_trt.nptype = lambda dt: np.float32
+
+    tmpdir = tempfile.mkdtemp(prefix='trt_cudart_')
+    eng_path = os.path.join(tmpdir, 'demo.engine')
+    onnx_path = os.path.join(tmpdir, 'demo.onnx')
+    with open(onnx_path, 'wb') as fh:
+        fh.write(b'ONNX')
+
+    auto_built = []
+    old_trt = sys.modules.get('tensorrt')
+    old_pycuda = sys.modules.get('pycuda')
+    old_pycuda_drv = sys.modules.get('pycuda.driver')
+    old_load_lib = lane_cnn._CudartRuntime._load_lib
+    old_auto_build = lane_cnn._auto_build_trt_engine
+
+    def _fake_auto_build(onnx_p, eng_p, workspace_mb=256):
+        auto_built.append((onnx_p, eng_p, workspace_mb))
+        with open(eng_p, 'wb') as fh:
+            fh.write(b'VALID_ENGINE')
+        return True
+
+    try:
+        sys.modules['tensorrt'] = fake_trt
+        sys.modules['pycuda'] = None
+        sys.modules['pycuda.driver'] = None
+        lane_cnn._CudartRuntime._load_lib = staticmethod(lambda: fake_lib)
+        lane_cnn._auto_build_trt_engine = _fake_auto_build
+
+        # Engine chua ton tai -> phai tu goi _auto_build_trt_engine roi nap qua libcudart
+        eng = lane_cnn.TensorRTEngine(eng_path)
+        assert len(auto_built) == 1
+        assert eng._cuda is None and eng._cudart is not None
+        assert 0 in fake_lib.freed  # cudaFree(0) khoi tao primary context
+
+        x = np.array([[[[1.0, 2.0], [3.0, 4.0]]]], dtype=np.float32)
+        out = eng.infer(x)
+        assert 'seg' in out and out['seg'].shape == (1, 1, 2, 2)
+        assert np.allclose(out['seg'], np.array([[[[3.0, 5.0], [7.0, 9.0]]]], dtype=np.float32))
+        assert fake_lib.syncs == 1
+
+        eng.close()
+        assert len(fake_lib.allocs) == 0
+        assert fake_lib.streams_destroyed == fake_lib.streams_created
+    finally:
+        lane_cnn._CudartRuntime._load_lib = old_load_lib
+        lane_cnn._auto_build_trt_engine = old_auto_build
+        if old_trt is None:
+            sys.modules.pop('tensorrt', None)
+        else:
+            sys.modules['tensorrt'] = old_trt
+        if old_pycuda is None:
+            sys.modules.pop('pycuda', None)
+        else:
+            sys.modules['pycuda'] = old_pycuda
+        if old_pycuda_drv is None:
+            sys.modules.pop('pycuda.driver', None)
+        else:
+            sys.modules['pycuda.driver'] = old_pycuda_drv
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 if __name__ == '__main__':
     failures = 0
     for name, fn in sorted(list(globals().items())):

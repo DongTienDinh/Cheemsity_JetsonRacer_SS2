@@ -36,7 +36,10 @@ Cai pycuda PHAI xuat bien CUDA truoc, khong thi loi 'cuda.h: No such file':
 
 from __future__ import print_function
 
+import ctypes
+import ctypes.util
 import os
+import subprocess
 import time
 
 import cv2
@@ -67,52 +70,194 @@ def _build_warp(w, h, src_pts, margin):
     return cv2.getPerspectiveTransform(src, dst)
 
 
-class TensorRTEngine(object):
-    """Boc engine TensorRT. Ho tro ca API binding (TRT 8.0) va tensor (TRT >=8.5).
+_TRTEXEC_CANDIDATES = (
+    '/usr/src/tensorrt/bin/trtexec',
+    'trtexec',
+)
+_CUDART_CANDIDATES = (
+    '/usr/local/cuda/lib64/libcudart.so',
+    '/usr/local/cuda-10.2/lib64/libcudart.so',
+    'libcudart.so',
+    'libcudart.so.10.2',
+)
 
-    Vi sao ho tro ca hai: xe chay TRT 7.1.3 dung API binding, nhung may dev hoac
-    ban JetPack khac co the la 8.5+ noi API do da bo. Doan if/else nay re hon
-    nhieu so voi mot buoi debug vi doi image.
+
+def _find_trtexec():
+    for path in _TRTEXEC_CANDIDATES:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def _auto_build_trt_engine(onnx_path, engine_path, workspace_mb=256):
+    """Tu dong build file .engine FP16 tu .onnx bang trtexec co san tren Jetson."""
+    trtexec = _find_trtexec()
+    if not trtexec or not os.path.isfile(onnx_path):
+        return False
+    out_dir = os.path.dirname(os.path.abspath(engine_path))
+    if out_dir and not os.path.isdir(out_dir):
+        os.makedirs(out_dir)
+    cmd = [
+        trtexec,
+        '--onnx=%s' % onnx_path,
+        '--fp16',
+        '--workspace=%d' % int(workspace_mb),
+        '--saveEngine=%s' % engine_path,
+    ]
+    print('[TRT] Khong thay/khac ban %s -> tu dong build FP16 tu %s (mat ~1-2 phut)...'
+          % (engine_path, onnx_path))
+    rc = subprocess.call(cmd)
+    return rc == 0 and os.path.isfile(engine_path)
+
+
+class _CudartRuntime(object):
+    """Boc CUDA Runtime C API (`libcudart.so`) qua ctypes — KHONG can cai `pycuda`.
+
+    `libcudart.so` co san 100% tren moi Jetson Nano JetPack -> sang Jetson moi
+    chi can pull code la chay duoc TensorRT FP16 ngay, khong can bien dich pycuda.
+    """
+
+    HTOD = 1
+    DTOH = 2
+
+    def __init__(self, lib=None):
+        if lib is None:
+            lib = self._load_lib()
+        self._lib = lib
+        self._lib.cudaSetDevice.argtypes = [ctypes.c_int]
+        self._lib.cudaSetDevice.restype = ctypes.c_int
+        self._lib.cudaMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+        self._lib.cudaMalloc.restype = ctypes.c_int
+        self._lib.cudaFree.argtypes = [ctypes.c_void_p]
+        self._lib.cudaFree.restype = ctypes.c_int
+        self._lib.cudaStreamCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        self._lib.cudaStreamCreate.restype = ctypes.c_int
+        self._lib.cudaStreamDestroy.argtypes = [ctypes.c_void_p]
+        self._lib.cudaStreamDestroy.restype = ctypes.c_int
+        self._lib.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
+        self._lib.cudaStreamSynchronize.restype = ctypes.c_int
+        self._lib.cudaMemcpyAsync.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p]
+        self._lib.cudaMemcpyAsync.restype = ctypes.c_int
+
+    @staticmethod
+    def _load_lib():
+        found = ctypes.util.find_library('cudart')
+        cands = list(_CUDART_CANDIDATES) + ([found] if found else [])
+        last_err = None
+        for name in cands:
+            try:
+                return ctypes.CDLL(name)
+            except OSError as exc:
+                last_err = exc
+        raise ImportError('Khong nap duoc libcudart.so: %s' % last_err)
+
+    def _check(self, err, fn_name):
+        if int(err) != 0:
+            raise RuntimeError('CUDA Runtime %s that bai (ma loi %d)' % (fn_name, int(err)))
+
+    def set_device(self, dev=0):
+        self._check(self._lib.cudaSetDevice(int(dev)), 'cudaSetDevice')
+
+    def init_context(self, dev=0):
+        """Chon GPU va ep khoi tao primary CUDA context bang `cudaFree(0)`."""
+        self.set_device(dev)
+        self._check(self._lib.cudaFree(ctypes.c_void_p(0)), 'cudaFree(0)')
+
+    def malloc(self, nbytes):
+        ptr = ctypes.c_void_p()
+        self._check(self._lib.cudaMalloc(ctypes.byref(ptr), int(nbytes)), 'cudaMalloc')
+        return int(ptr.value)
+
+    def free(self, ptr_int):
+        if ptr_int:
+            self._lib.cudaFree(ctypes.c_void_p(int(ptr_int)))
+
+    def create_stream(self):
+        stream = ctypes.c_void_p()
+        self._check(self._lib.cudaStreamCreate(ctypes.byref(stream)), 'cudaStreamCreate')
+        return int(stream.value)
+
+    def destroy_stream(self, stream_int):
+        if stream_int:
+            self._lib.cudaStreamDestroy(ctypes.c_void_p(int(stream_int)))
+
+    def sync_stream(self, stream_int):
+        self._check(
+            self._lib.cudaStreamSynchronize(ctypes.c_void_p(int(stream_int))),
+            'cudaStreamSynchronize')
+
+    def memcpy_htod_async(self, dst_dev_int, host_arr, stream_int):
+        self._check(
+            self._lib.cudaMemcpyAsync(
+                ctypes.c_void_p(int(dst_dev_int)),
+                ctypes.c_void_p(int(host_arr.ctypes.data)),
+                int(host_arr.nbytes),
+                self.HTOD,
+                ctypes.c_void_p(int(stream_int)),
+            ),
+            'cudaMemcpyAsync(HtoD)')
+
+    def memcpy_dtoh_async(self, host_arr, src_dev_int, stream_int):
+        self._check(
+            self._lib.cudaMemcpyAsync(
+                ctypes.c_void_p(int(host_arr.ctypes.data)),
+                ctypes.c_void_p(int(src_dev_int)),
+                int(host_arr.nbytes),
+                self.DTOH,
+                ctypes.c_void_p(int(stream_int)),
+            ),
+            'cudaMemcpyAsync(DtoH)')
+
+
+class TensorRTEngine(object):
+    """Boc engine TensorRT. Ho tro ca API binding (TRT 7/8.0) va tensor (TRT >=8.5).
+
+    Tu dong dung `pycuda` neu co, hoac chuyen sang `libcudart.so` (ctypes co san trong
+    JetPack) khi Jetson chua cai `pycuda` -> pull code la chay duoc ngay!
     """
 
     def __init__(self, engine_path):
         try:
             import tensorrt as trt
-            import pycuda.driver as cuda
-            # CO Y KHONG dung `pycuda.autoinit`. autoinit tao context va day len
-            # NGAN XEP CUA DUNG THREAD DANG IMPORT. Detector duoc tao o thread
-            # chinh, con vong camera cua giao dien chay o THREAD NEN -> thread do
-            # khong co context nao, moi loi goi CUDA deu that bai.
-            # Trieu chung khong phai "bao loi ro rang" ma la: panel dung im o
-            # khung hinh dau tien, mask va cte khong doi du camera van cap nhat -
-            # vi `_loop` bat exception roi break, chi con anh cuoi cung tren man.
-            # Cach dung dung: giu primary context, push/pop quanh moi lan suy dien.
-            cuda.init()
         except ImportError as exc:
             raise ImportError(
                 '%s.\n'
-                'lane.mode=cnn CHI chay duoc tren Jetson. tensorrt co san theo\n'
-                'JetPack; pycuda phai cai them va PHAI xuat bien CUDA truoc,\n'
-                'neu khong se loi "cuda.h: No such file or directory":\n'
-                '  export PATH=/usr/local/cuda/bin:$PATH\n'
-                '  export CPATH=/usr/local/cuda/include:$CPATH\n'
-                '  export LIBRARY_PATH=/usr/local/cuda/lib64:$LIBRARY_PATH\n'
-                '  pip3 install --user --no-cache-dir pycuda   (KHONG dung sudo:\n'
-                '  sudo xoa sach cac bien vua xuat)\n'
+                'lane.mode=cnn CHI chay duoc tren Jetson (tensorrt co san theo JetPack).\n'
                 'Tren laptop: dat lane.cnn.backend=onnx de chay bang ONNXRuntime,\n'
                 'hoac lane.cnn.engine rong de chi dung hau xu ly.'
                 % exc)
+
+        cuda = None
+        cudart = None
+        try:
+            import pycuda.driver as cuda
+            # CO Y KHONG dung `pycuda.autoinit` (tranh loi context giua cac thread).
+            cuda.init()
+        except ImportError as pycuda_exc:
+            try:
+                cudart = _CudartRuntime()
+                cudart.init_context(0)
+                print('[TRT] Khong co pycuda -> dung truc tiep libcudart.so (ctypes, khong can cai them).')
+            except Exception as rt_exc:
+                raise ImportError(
+                    'Khong co pycuda (%s) va khong nap duoc libcudart.so (%s).\n'
+                    'Tren laptop: dat lane.cnn.backend=onnx hoac de trong lane.cnn.engine.'
+                    % (pycuda_exc, rt_exc))
+
+        onnx_sibling = os.path.splitext(engine_path)[0] + '.onnx'
         if not os.path.isfile(engine_path):
-            raise IOError(
-                'Khong thay engine: %s\n'
-                'Build TREN CHINH XE:\n'
-                '  /usr/src/tensorrt/bin/trtexec --onnx=lane_tiny.onnx '
-                '--fp16 --workspace=256 --saveEngine=%s'
-                % (engine_path, engine_path))
+            if not _auto_build_trt_engine(onnx_sibling, engine_path):
+                raise IOError(
+                    'Khong thay engine: %s\n'
+                    'Build TREN CHINH XE:\n'
+                    '  python3 tools/setup_jetson_models.py --model road_fast'
+                    % engine_path)
 
         import threading
         self._cuda = cuda
-        self._ctx = cuda.Device(0).retain_primary_context()
+        self._cudart = cudart
+        self._ctx = cuda.Device(0).retain_primary_context() if cuda is not None else None
         self._closed = False
         self.engine = None
         self.context = None
@@ -124,34 +269,39 @@ class TensorRTEngine(object):
         self._lock = threading.Lock()
 
         logger = trt.Logger(trt.Logger.WARNING)
-        self._ctx.push()
-        try:
+        if self._ctx is not None:
+            self._ctx.push()
             try:
-                self._build(trt, cuda, engine_path, logger)
-            finally:
-                self._ctx.pop()
-        except BaseException:
-            self.close()
-            raise
+                try:
+                    self._build(trt, engine_path, onnx_sibling, logger)
+                finally:
+                    self._ctx.pop()
+            except BaseException:
+                self.close()
+                raise
+        else:
+            try:
+                self._cudart.set_device(0)
+                self._build(trt, engine_path, onnx_sibling, logger)
+            except BaseException:
+                self.close()
+                raise
 
-    def _build(self, trt, cuda, engine_path, logger):
+    def _build(self, trt, engine_path, onnx_sibling, logger):
+        runtime = trt.Runtime(logger)
         with open(engine_path, 'rb') as fh:
-            runtime = trt.Runtime(logger)
             self.engine = runtime.deserialize_cuda_engine(fh.read())
+        if self.engine is None and _auto_build_trt_engine(onnx_sibling, engine_path):
+            with open(engine_path, 'rb') as fh:
+                self.engine = runtime.deserialize_cuda_engine(fh.read())
         if self.engine is None:
             raise RuntimeError(
                 'TensorRT khong doc duoc %s. Gan nhu chac chan engine nay build '
-                'tren may/phien ban khac - engine KHONG chuyen may duoc.'
+                'tren may/phien ban khac - chay `python3 tools/setup_jetson_models.py --force`.'
                 % engine_path)
         self.context = self.engine.create_execution_context()
         self._new_api = hasattr(self.engine, 'num_io_tensors')
 
-        # THU TU BINDING CUA ENGINE KHONG PHAI THU TU KHAI BAO TRONG ONNX.
-        # Do binding nao la vao/ra bang API cua engine, va tra ket qua theo TEN.
-        # Ban dau file nay gia dinh outs[0] = seg, outs[1] = reg -> tren xe
-        # TensorRT tra reg truoc va no gay "cannot reshape array of size 3 into
-        # shape (64,128)". Loi chi lo ra khi co engine that, khong cach nao bat
-        # duoc tren laptop.
         self.host, self.dev, self.names, self.shapes = [], [], [], []
         self.in_idx, self.out_idx = [], []
         if self._new_api:
@@ -169,14 +319,23 @@ class TensorRTEngine(object):
                             self.engine.binding_is_input(i))
         if not self.in_idx or not self.out_idx:
             raise RuntimeError('Engine khong co du input/output: %s' % self.names)
-        self.stream = cuda.Stream()
+        if self._cuda is not None:
+            self.stream = self._cuda.Stream()
+        else:
+            self.stream = self._cudart.create_stream()
         self.bindings = [int(d) for d in self.dev]
 
     def _alloc(self, name, shape, dtype, is_input):
         idx = len(self.host)
-        host = self._cuda.pagelocked_empty(int(np.prod(shape)), dtype)
+        n_elems = int(np.prod(shape))
+        if self._cuda is not None:
+            host = self._cuda.pagelocked_empty(n_elems, dtype)
+            dev = self._cuda.mem_alloc(host.nbytes)
+        else:
+            host = np.empty(n_elems, dtype=dtype)
+            dev = self._cudart.malloc(host.nbytes)
         self.host.append(host)
-        self.dev.append(self._cuda.mem_alloc(host.nbytes))
+        self.dev.append(dev)
         self.names.append(name)
         self.shapes.append(shape)
         (self.in_idx if is_input else self.out_idx).append(idx)
@@ -184,67 +343,101 @@ class TensorRTEngine(object):
     def infer(self, x):
         """x: float32 (1,3,H,W) lien tuc -> dict {ten: mang}.
 
-        Push/pop context moi lan goi de chay duoc tu BAT KY thread nao.
+        An toan da luong cho ca PyCUDA lan libcudart.so (ctypes).
         """
         with self._lock:
-            if self._closed or self._ctx is None:
+            if self._closed or (self._ctx is None and self._cudart is None):
                 raise RuntimeError('TensorRTEngine da dong')
-            self._ctx.push()
-            try:
-                return self._infer_locked(x)
-            finally:
-                self._ctx.pop()
+            if self._ctx is not None:
+                self._ctx.push()
+                try:
+                    return self._infer_locked(x)
+                finally:
+                    self._ctx.pop()
+            self._cudart.set_device(0)
+            return self._infer_locked(x)
 
     def close(self):
-        """Giai phong buffer GPU/TRT TRONG primary context roi moi detach.
-
-        Neu de Python GC pha engine/buffer NGOAI context (vi du `del _det`
-        trong notebook truoc `launch()`), PyCUDA canh bao dead context va ro ri
-        bo nho tren Jetson Nano 4GB.
-        """
+        """Giai phong buffer GPU/TRT an toan cho ca PyCUDA lan libcudart."""
         with self._lock:
             if self._closed:
                 return
             self._closed = True
             ctx = self._ctx
             self._ctx = None
-            if ctx is None:
-                return
-            try:
-                ctx.push()
+            if ctx is not None:
                 try:
-                    self.context = None
-                    self.engine = None
-                    self.stream = None
-                    self.dev = []
-                    self.host = []
-                    self.bindings = []
-                finally:
-                    ctx.pop()
-            except Exception:
-                pass
-            try:
-                ctx.detach()
-            except Exception:
-                pass
+                    ctx.push()
+                    try:
+                        self.context = None
+                        self.engine = None
+                        self.stream = None
+                        self.dev = []
+                        self.host = []
+                        self.bindings = []
+                    finally:
+                        ctx.pop()
+                except Exception:
+                    pass
+                try:
+                    ctx.detach()
+                except Exception:
+                    pass
+                return
+            if self._cudart is not None:
+                try:
+                    self._cudart.set_device(0)
+                except Exception:
+                    pass
+                self.context = None
+                self.engine = None
+                for ptr in self.dev:
+                    try:
+                        self._cudart.free(ptr)
+                    except Exception:
+                        pass
+                if self.stream:
+                    try:
+                        self._cudart.destroy_stream(self.stream)
+                    except Exception:
+                        pass
+                self.stream = None
+                self.dev = []
+                self.host = []
+                self.bindings = []
+                self._cudart = None
 
     def _infer_locked(self, x):
-        cuda = self._cuda
         i0 = self.in_idx[0]
         np.copyto(self.host[i0], x.ravel())
-        cuda.memcpy_htod_async(self.dev[i0], self.host[i0], self.stream)
-        if self._new_api:
-            for nm, d in zip(self.names, self.dev):
-                self.context.set_tensor_address(nm, int(d))
-            self.context.execute_async_v3(stream_handle=self.stream.handle)
+        if self._cuda is not None:
+            cuda = self._cuda
+            cuda.memcpy_htod_async(self.dev[i0], self.host[i0], self.stream)
+            stream_handle = self.stream.handle
+            if self._new_api:
+                for nm, d in zip(self.names, self.dev):
+                    self.context.set_tensor_address(nm, int(d))
+                self.context.execute_async_v3(stream_handle=stream_handle)
+            else:
+                self.context.execute_async_v2(bindings=self.bindings,
+                                              stream_handle=stream_handle)
+            for i in self.out_idx:
+                cuda.memcpy_dtoh_async(self.host[i], self.dev[i], self.stream)
+            self.stream.synchronize()
         else:
-            self.context.execute_async_v2(bindings=self.bindings,
-                                          stream_handle=self.stream.handle)
-        for i in self.out_idx:
-            cuda.memcpy_dtoh_async(self.host[i], self.dev[i], self.stream)
-        self.stream.synchronize()
-        # `.copy()`: host buffer la pagelocked va bi GHI DE o lan infer sau.
-        # Tra ve view thi ket qua co the doi duoi tay nguoi goi.
+            rt = self._cudart
+            rt.memcpy_htod_async(self.dev[i0], self.host[i0], self.stream)
+            stream_handle = int(self.stream)
+            if self._new_api:
+                for nm, d in zip(self.names, self.dev):
+                    self.context.set_tensor_address(nm, int(d))
+                self.context.execute_async_v3(stream_handle=stream_handle)
+            else:
+                self.context.execute_async_v2(bindings=self.bindings,
+                                              stream_handle=stream_handle)
+            for i in self.out_idx:
+                rt.memcpy_dtoh_async(self.host[i], self.dev[i], self.stream)
+            rt.sync_stream(self.stream)
         return dict((self.names[i],
                      self.host[i].reshape(self.shapes[i]).copy())
                     for i in self.out_idx)

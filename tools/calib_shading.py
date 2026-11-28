@@ -29,11 +29,11 @@ import sys
 
 import cv2
 import numpy as np
-import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), 'src'))
 
+from jetracer_baseline.config import yaml_safe_dump  # noqa: E402
 from jetracer_baseline.perception.shading import (  # noqa: E402
     ShadingCorrector, fit_coefficients, measure_ratio_profile)
 
@@ -208,7 +208,7 @@ def main(argv=None):
     if out_dir and not os.path.isdir(out_dir):
         os.makedirs(out_dir)
     with io.open(args.out, 'w', encoding='utf-8') as fh:
-        fh.write(yaml.safe_dump(data, default_flow_style=False,
+        fh.write(yaml_safe_dump(data, default_flow_style=False,
                                 allow_unicode=True))
     print('\nDa ghi: %s' % args.out)
     if args.mode == 'drive':

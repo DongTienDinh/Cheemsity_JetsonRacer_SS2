@@ -29,11 +29,10 @@ from collections import deque
 
 import cv2
 import numpy as np
-import yaml
 
 from .camera import (LatestFrameGrabber, build_source,
                      format_camera_environment, shading_applied_at_source)
-from .config import load_config
+from .config import load_config, yaml_safe_dump
 from .control.corner import CornerController
 from .control.driver import servo_output_for
 from .control.driver import build_driver
@@ -720,7 +719,7 @@ class LaneTuningEngine(object):
             % (time.strftime('%Y-%m-%d %H:%M:%S'), path, self.config_path))
         with io.open(path, 'w', encoding='utf-8') as fh:
             fh.write(header)
-            fh.write(yaml.safe_dump(diff, default_flow_style=False,
+            fh.write(yaml_safe_dump(diff, default_flow_style=False,
                                     allow_unicode=True))
         return diff
 
