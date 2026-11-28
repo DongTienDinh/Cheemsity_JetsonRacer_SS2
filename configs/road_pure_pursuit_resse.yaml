@@ -1,0 +1,35 @@
+# Chế độ DỰ PHÒNG cho Speed Track: Road-Only Pure Pursuit + LaneTiny-ResSE (25-30 FPS Nano)
+#   - Giữ nguyên 100% configs/default.yaml; dùng ResSE khi sân có bóng đổ / chói đèn mạnh.
+
+camera:
+  width: 320
+  height: 240
+  shading:
+    apply_at: pipeline
+
+tuning:
+  preview_hz: 5
+  run_preview_hz: 1.0
+
+lane:
+  mode: cnn
+  cnn:
+    backend: trt
+    engine: models/lane_road_only_resse.engine
+    road_only: true
+    roi_top: 0.34
+    warp_src: [[0.00, 0.92], [1.00, 0.92], [0.66, 0.42], [0.33, 0.42]]
+    warp_dst_margin: 0.32
+
+control:
+  mode: pure_pursuit
+  pure_pursuit:
+    lookahead_px: 84.0
+    gain: 1.15
+    half_lane_px: 82.0
+    wheel_deg_at_limit: 34.0
+    car_length_px: 76.0
+    edge_margin_px: 54.0
+    edge_push_gain: 0.45
+    steer_smooth: 0.72
+    max_hole_area: 180

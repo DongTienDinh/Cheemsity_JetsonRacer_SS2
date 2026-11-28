@@ -1,0 +1,45 @@
+# Chế độ KHUYÊN DÙNG cho Speed Track: Road-Only Pure Pursuit + LaneTiny-Fast (30+ FPS Nano)
+#   - GIỮ NGUYÊN 100% các giới hạn cố định của configs/default.yaml
+#     (steering_output_min/max = ±0.40, steering_gain = -0.65, throttle_gain = 0.80,
+#      v_straight = 0.30, v_corner = 0.12, control_hz = 30).
+#   - Chỉ dùng duy nhất kênh Ch0 (drivable_road) của model ONNX/TRT (bỏ Ch1 trắng & Ch2 tâm ảo).
+#   - Không cần LiDAR; tự uốn quanh lỗ khuyết mặt đường do vật cản tĩnh.
+#
+# Cách chạy trên Jetson Nano:
+#   python3 -m src.jetracer_baseline.cli run --task speed --driver nvidia \
+#       --override configs/road_pure_pursuit.yaml --record
+
+camera:
+  width: 320
+  height: 240
+  shading:
+    apply_at: pipeline
+
+tuning:
+  preview_hz: 5
+  run_preview_hz: 1.0
+
+lane:
+  mode: cnn
+  cnn:
+    backend: trt
+    # Model cat tia 1 kenh Ch0 (bo Ch1/Ch2 + reg_head -> giam 3x copy GPU->CPU)
+    engine: models/lane_road_only_fast.engine
+    road_only: true
+    # Hình học KHỚP TUYỆT ĐỐI với tools/train_lane_option_b.py
+    roi_top: 0.34
+    warp_src: [[0.00, 0.92], [1.00, 0.92], [0.66, 0.42], [0.33, 0.42]]
+    warp_dst_margin: 0.32
+
+control:
+  mode: pure_pursuit
+  pure_pursuit:
+    lookahead_px: 84.0
+    gain: 1.15
+    half_lane_px: 82.0
+    wheel_deg_at_limit: 34.0
+    car_length_px: 76.0
+    edge_margin_px: 54.0
+    edge_push_gain: 0.45
+    steer_smooth: 0.72
+    max_hole_area: 180

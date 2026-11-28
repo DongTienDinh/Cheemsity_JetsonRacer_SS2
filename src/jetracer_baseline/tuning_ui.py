@@ -38,7 +38,9 @@ from .control.corner import CornerController
 from .control.driver import servo_output_for
 from .control.driver import build_driver
 from .control.pid import PID
+from .control.pure_pursuit import RoadPurePursuitController
 from .perception import build_lane_detector
+from .perception.lane import LaneResult
 from .manual_collection import (
     DatasetSessionWriter, shape_steering, shape_throttle, slew_towards)
 from .perception.shading import ShadingCorrector
@@ -107,6 +109,17 @@ CONTROL_PARAMS = [
     ('control.slowdown', 'Bo ga theo lech', 0.0, 1.0, 0.01),
     ('control.v_min', 'Ga toi thieu', 0.00, 0.40, 0.01),
     ('control.v_max', 'Tran ga (an toan)', 0.00, 0.80, 0.01),
+]
+
+# Giao dien dieu khien rut gon cho bo dieu khien moi (Road-Only Pure Pursuit):
+# Giu nguyen toan bo thuat toan Pure Pursuit o duoi, tren UI chi bay 5 thanh
+# thuc te nhat khi chay thu: toc do thang, toc do cua, do cua servo, tam ngam, do nhay lai.
+PURE_PURSUIT_PARAMS = [
+    ('control.v_straight', 'Toc do thang', 0.05, 0.80, 0.01),
+    ('control.v_corner', 'Toc do trong cua', 0.05, 0.50, 0.01),
+    ('control.driver.steering_output_max', 'Do cua servo (+-)', 0.30, 0.85, 0.05),
+    ('control.pure_pursuit.lookahead_px', 'Tam ngam cua (px)', 50.0, 140.0, 2.0),
+    ('control.pure_pursuit.gain', 'Do nhay lai', 0.60, 2.00, 0.05),
 ]
 
 
@@ -381,6 +394,14 @@ class LaneTuningEngine(object):
             self.corner = CornerController(cfg)
         else:
             self.corner.reset_from_config(cfg)
+        self.control_mode = str(cfg.get('control.mode', 'corner'))
+        if self.control_mode == 'pure_pursuit':
+            if getattr(self, 'pure_pursuit', None) is None:
+                self.pure_pursuit = RoadPurePursuitController(cfg)
+            else:
+                self.pure_pursuit.reset_from_config(cfg)
+        else:
+            self.pure_pursuit = None
         self.proc_size = (int(cfg.get('pipeline.proc_width', 320)),
                           int(cfg.get('pipeline.proc_height', 240)))
         self.v_max = float(cfg.get('control.v_max', 0.20))
@@ -405,9 +426,12 @@ class LaneTuningEngine(object):
         """Danh dau bat dau chay -> ga bat dau ramp tu 0."""
         self._run_t0 = time.time() if now is None else now
         self._motion_t0 = self._run_t0
-        self._waiting_for_path = bool(getattr(self.lane, 'road_guided', False))
+        self._waiting_for_path = bool(
+            getattr(self.lane, 'road_guided', False) or self.pure_pursuit is not None)
         self.pid.reset()
         self.corner.reset()
+        if self.pure_pursuit is not None:
+            self.pure_pursuit.reset()
 
     def stop_run(self):
         self._run_t0 = None
@@ -446,24 +470,53 @@ class LaneTuningEngine(object):
         else:
             res = self.lane.process(proc)
 
-        look_w = self.corner.effective_lookahead_weight(self.steer_look_w)
-        err = ((1.0 - look_w) * res.cte + look_w * res.cte_lookahead)
-        road_turn = getattr(self.lane, 'last_road_turn', 0)
-        if not res.found or res.cte_lookahead * road_turn <= 0.0:
+        use_pp = (self.pure_pursuit is not None and
+                  getattr(self.lane, 'last_road_logits', None) is not None)
+        if use_pp:
+            pp_out = self.pure_pursuit.step(self.lane.last_road_logits, dt)
+            res = LaneResult(
+                pp_out['found'], pp_out['cte'], pp_out['curvature'],
+                res.n_pixels, None,
+                cte_lookahead=pp_out['lookahead'], n_bands=pp_out['n_bands'])
+            err = pp_out['lookahead']
+            start_ready = self.pure_pursuit.road_start_ready
+            if self._waiting_for_path and res.found and start_ready:
+                self._waiting_for_path = False
+                self._motion_t0 = time.time() if now is None else now
+            if self._waiting_for_path:
+                pid_out = steer = throttle = ramp = 0.0
+                mode = self.pure_pursuit.mode
+            else:
+                pid_out = pp_out['steer']
+                steer = pp_out['steer']
+                mode = pp_out['mode']
+                ramp = self.soft_start_scale(now)
+                throttle = pp_out['throttle'] * ramp
+            steer_wanted = self.pure_pursuit.steer_wanted
+            steer_limit = self.pure_pursuit.steer_limit
             road_turn = 0
-        if self._waiting_for_path and res.found and self.lane.road_start_ready:
-            self._waiting_for_path = False
-            self._motion_t0 = time.time() if now is None else now
-        if self._waiting_for_path:
-            pid_out = steer = throttle = ramp = 0.0
-            mode = self.corner.mode
         else:
-            pid_out = self.pid.step(err, dt)
-            steer, throttle, mode = self.corner.step(
-                pid_out, res.cte, res.curvature, dt, lane_found=res.found,
-                road_turn=road_turn, cte_lookahead=res.cte_lookahead)
-            ramp = self.soft_start_scale(now)
-            throttle *= ramp
+            look_w = self.corner.effective_lookahead_weight(self.steer_look_w)
+            err = ((1.0 - look_w) * res.cte + look_w * res.cte_lookahead)
+            road_turn = getattr(self.lane, 'last_road_turn', 0)
+            if not res.found or res.cte_lookahead * road_turn <= 0.0:
+                road_turn = 0
+            start_ready = getattr(self.lane, 'road_start_ready', False)
+            if self._waiting_for_path and res.found and start_ready:
+                self._waiting_for_path = False
+                self._motion_t0 = time.time() if now is None else now
+            if self._waiting_for_path:
+                pid_out = steer = throttle = ramp = 0.0
+                mode = self.corner.mode
+            else:
+                pid_out = self.pid.step(err, dt)
+                steer, throttle, mode = self.corner.step(
+                    pid_out, res.cte, res.curvature, dt, lane_found=res.found,
+                    road_turn=road_turn, cte_lookahead=res.cte_lookahead)
+                ramp = self.soft_start_scale(now)
+                throttle *= ramp
+            steer_wanted = self.corner.steer_wanted
+            steer_limit = self.corner.steer_limit
 
         servo, servo_raw = servo_output_for(
             steer, self.drv_gain, self.drv_offset,
@@ -472,7 +525,7 @@ class LaneTuningEngine(object):
         #   - `steer_clipped`: bi tran phan mem (steer_max / corner_steer_max)
         #   - `servo_clipped`: bi hard-limit cua driver (steering_output_max)
         # Chi bao "lai toi da" chung chung thi nguoi dung se chinh nham num.
-        steer_clipped = abs(self.corner.steer_wanted) > self.corner.steer_limit + 1e-6
+        steer_clipped = abs(steer_wanted) > steer_limit + 1e-6
         servo_clipped = abs(servo_raw - servo) > 1e-6
 
         road_guided = getattr(self.lane, 'road_guided', False)
@@ -482,18 +535,23 @@ class LaneTuningEngine(object):
             'error': err, 'ramp': ramp, 'mode': mode, 'pid': pid_out,
             'servo': servo, 'servo_span': self.drv_out_max,
             'steer_clipped': steer_clipped, 'servo_clipped': servo_clipped,
-            'steer_wanted': self.corner.steer_wanted,
+            'steer_wanted': steer_wanted,
             'infer_ms': float(getattr(self.lane, 'last_infer_ms', 0.0)),
             'lane_total_ms': float(getattr(self.lane, 'last_total_ms', 0.0)),
+            'pure_pursuit': bool(use_pp),
         }
         if road_guided:
             result['road_guided'] = True
-            result['road_start_ready'] = self.lane.road_start_ready
+            result['road_start_ready'] = start_ready
             result['waiting_for_path'] = self._waiting_for_path
-            result['road_turn'] = self.lane.last_road_turn
-            result['used_fallback'] = self.lane.last_used_fallback
-            result['curvy_zone'] = self.corner.curvy_zone
-            result['corner_delay_active'] = self.corner.corner_delay_active
+            result['road_turn'] = 0 if use_pp else self.lane.last_road_turn
+            result['used_fallback'] = False if use_pp else self.lane.last_used_fallback
+            result['curvy_zone'] = False if use_pp else self.corner.curvy_zone
+            result['corner_delay_active'] = False if use_pp else self.corner.corner_delay_active
+            if use_pp:
+                result['obstacle_hole'] = bool(self.pure_pursuit.debug_obstacle_hole)
+                if copy_preview:
+                    result['_preview_pp_bev'] = self.pure_pursuit.render_bev_debug()
         if copy_preview:
             lane_mask = getattr(self.lane, 'last_mask', None)
             if lane_mask is not None:
@@ -540,22 +598,31 @@ class LaneTuningEngine(object):
             overlay = cv2.addWeighted(ov, 0.50, proc, 0.50, 0)
             cv2.line(overlay, (0, y0), (pw, y0), (0, 255, 255), 1)
             cv2.line(binary, (0, y0), (pw, y0), (70, 70, 70), 1)
-            _label(overlay, 'MAT DUONG (XANH) + TAM (VANG)')
-            turn = result.get('road_turn', 0)
-            side = 'PHAI' if turn > 0 else 'TRAI'
-            if result.get('used_fallback'):
-                tag_txt, tag_col = 'TAM TU MEP XANH', (0, 220, 255)
-                if turn:
-                    tag_txt += ' - CUA ' + side
-            elif turn:
-                tag_txt, tag_col = 'MEP XANH BAO CUA ' + side, (0, 220, 255)
+            if result.get('pure_pursuit'):
+                _label(overlay, 'MAT DUONG CH0 (XANH) - PURE PURSUIT')
+                if result.get('obstacle_hole'):
+                    tag_txt, tag_col = 'PURE PURSUIT | TRANH VAT CAN', (0, 200, 255)
+                elif res.found:
+                    tag_txt, tag_col = 'PURE PURSUIT (CHI CH0)', (60, 235, 60)
+                else:
+                    tag_txt, tag_col = 'MAT MAT DUONG CH0', (60, 60, 255)
             else:
-                tag_txt, tag_col = ('BAM TAM VANG', (60, 230, 60)) if res.found else (
-                    'CHUA CO TAM DUONG', (60, 60, 255))
-            if result.get('curvy_zone'):
-                tag_txt += ' | VUNG CUA'
-            if result.get('corner_delay_active'):
-                tag_txt += ' | TRE'
+                _label(overlay, 'MAT DUONG (XANH) + TAM (VANG)')
+                turn = result.get('road_turn', 0)
+                side = 'PHAI' if turn > 0 else 'TRAI'
+                if result.get('used_fallback'):
+                    tag_txt, tag_col = 'TAM TU MEP XANH', (0, 220, 255)
+                    if turn:
+                        tag_txt += ' - CUA ' + side
+                elif turn:
+                    tag_txt, tag_col = 'MEP XANH BAO CUA ' + side, (0, 220, 255)
+                else:
+                    tag_txt, tag_col = ('BAM TAM VANG', (60, 230, 60)) if res.found else (
+                        'CHUA CO TAM DUONG', (60, 60, 255))
+                if result.get('curvy_zone'):
+                    tag_txt += ' | VUNG CUA'
+                if result.get('corner_delay_active'):
+                    tag_txt += ' | TRE'
             _label(binary, 'OPTION B: ' + tag_txt)
             cv2.circle(binary, (pw - 10, 8), 5, tag_col, -1)
         else:
@@ -581,25 +648,30 @@ class LaneTuningEngine(object):
             _label(binary, 'MASK (nguong mau)')
 
         # (3) bird's-eye + duong fit + diem ngam
-        warped = res.debug
-        if warped is None:
-            warped = np.zeros((ph, pw), np.uint8)
-        bev = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
-        cv2.line(bev, (pw // 2, 0), (pw // 2, ph), (0, 255, 0), 1)
-        if res.fit is not None:
-            pts = []
-            for t in np.linspace(0.0, 1.0, 41):
-                x = res.fit[0] * t * t + res.fit[1] * t + res.fit[2]
-                pts.append([int(x), ph - int(t * ph)])
-            cv2.polylines(bev, [np.array(pts, np.int32)], False, (0, 0, 255), 2)
-            if hasattr(self.lane, '_binarise'):
-                t_look = float(self.cfg.get('lane.lookahead', 0.6))
-            else:
-                t_look = float(getattr(self.lane, 'lookahead',
-                                       self.cfg.get('lane.cnn.lookahead', 0.6)))
-            xl = res.fit[0] * t_look * t_look + res.fit[1] * t_look + res.fit[2]
-            cv2.circle(bev, (int(xl), ph - int(t_look * ph)), 5, (255, 0, 255), -1)
-        _label(bev, "BIRD'S-EYE + duong fit")
+        pp_bev = result.get('_preview_pp_bev')
+        if pp_bev is not None:
+            bev = pp_bev.copy()
+            _label(bev, "BEV CH0 + TRUC TAM + PURE PURSUIT")
+        else:
+            warped = res.debug
+            if warped is None:
+                warped = np.zeros((ph, pw), np.uint8)
+            bev = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
+            cv2.line(bev, (pw // 2, 0), (pw // 2, ph), (0, 255, 0), 1)
+            if res.fit is not None:
+                pts = []
+                for t in np.linspace(0.0, 1.0, 41):
+                    x = res.fit[0] * t * t + res.fit[1] * t + res.fit[2]
+                    pts.append([int(x), ph - int(t * ph)])
+                cv2.polylines(bev, [np.array(pts, np.int32)], False, (0, 0, 255), 2)
+                if hasattr(self.lane, '_binarise'):
+                    t_look = float(self.cfg.get('lane.lookahead', 0.6))
+                else:
+                    t_look = float(getattr(self.lane, 'lookahead',
+                                           self.cfg.get('lane.cnn.lookahead', 0.6)))
+                xl = res.fit[0] * t_look * t_look + res.fit[1] * t_look + res.fit[2]
+                cv2.circle(bev, (int(xl), ph - int(t_look * ph)), 5, (255, 0, 255), -1)
+            _label(bev, "BIRD'S-EYE + duong fit")
 
         # (4) do thi CTE/lai truot - cho thay dao dong, thu bang so khong thay
         chart = _draw_chart(self.stats.cte_history(), self.stats.steer_history(),
@@ -946,10 +1018,24 @@ class LaneTuningUI(object):
             description='Sua mau (shading)')
 
         self._sliders = {}
-        # Chon dung bo slider theo nguon bam vach dang chay.
+        # Chon dung bo slider theo nguon bam vach va bo dieu khien dang chay.
         self.dung_cnn = type(self.engine.lane).__name__ == 'CnnLaneDetector'
-        self.lane_box = self._build_sliders(
-            CNN_LANE_PARAMS if self.dung_cnn else LANE_PARAMS)
+        self.is_pure_pursuit = (
+            getattr(self.engine, 'control_mode', 'corner') == 'pure_pursuit')
+        self.is_road_only = bool(
+            self.engine.get_param('lane.cnn.road_only', False))
+        if self.dung_cnn and self.is_road_only:
+            self.lane_box = widgets.VBox([
+                widgets.HTML(
+                    '<div style="padding:8px;border-radius:4px;background:#f0fdf4;'
+                    'border:1px solid #86efac;font-size:12px;line-height:1.5">'
+                    '<b>Che do chi dung mat duong Ch0 (Road-Only)</b><br>'
+                    'Khong can chinh nguong mau hay tham so tam vang Ch2.<br>'
+                    'Chuyen sang tab <b>Dieu khien</b> de chinh toc do, do cua servo va Pure Pursuit.</div>')
+            ])
+        else:
+            self.lane_box = self._build_sliders(
+                CNN_LANE_PARAMS if self.dung_cnn else LANE_PARAMS)
         self.simple_box = None      # che do don gian tu dung num rieng
         self._logger = None
         self._logger_lock = threading.Lock()
@@ -957,7 +1043,10 @@ class LaneTuningUI(object):
         self._run_started_mono = None
         self._last_run_summary = None
         self.log_dir = str(self.engine.get_param('logging.dir', 'logs'))
-        self.control_box = self._build_sliders(CONTROL_PARAMS)
+        if self.is_pure_pursuit:
+            self.control_box = self._build_pp_sliders()
+        else:
+            self.control_box = self._build_sliders(CONTROL_PARAMS)
         self.manual_box = self._build_sliders(MANUAL_PARAMS,
                                               on_change=self._apply_manual)
 
@@ -1529,16 +1618,18 @@ class LaneTuningUI(object):
         if s is None:
             return '<i>chua co so lieu</i>'
         warn = []
+        is_pp = getattr(self.engine, 'pure_pursuit', None) is not None
         span = abs(self.engine.drv_out_max)
-        reach = min(abs(self.engine.corner.corner_steer_max
-                        * self.engine.drv_gain), span)
-        if reach < 0.95 * 1.0:
-            warn.append(
-                'servo chi dung %.0f%% tam quay (lai %.2f x gain %.2f, '
-                'hard-limit %.2f) -> ban kinh cua bi rong. Hieu chuan bang '
-                'tools/check_hardware.py --calibrate-steering'
-                % (100 * reach, self.engine.corner.corner_steer_max,
-                   abs(self.engine.drv_gain), span))
+        if not is_pp:
+            reach = min(abs(self.engine.corner.corner_steer_max
+                            * self.engine.drv_gain), span)
+            if reach < 0.95 * 1.0:
+                warn.append(
+                    'servo chi dung %.0f%% tam quay (lai %.2f x gain %.2f, '
+                    'hard-limit %.2f) -> ban kinh cua bi rong. Hieu chuan bang '
+                    'tools/check_hardware.py --calibrate-steering'
+                    % (100 * reach, self.engine.corner.corner_steer_max,
+                       abs(self.engine.drv_gain), span))
         if s['loss_pct'] > 2.0:
             warn.append('mat vach %.1f%% (muc tieu <= 2%%)' % s['loss_pct'])
         if s['bands_mean'] < 3.0:
@@ -1550,8 +1641,9 @@ class LaneTuningUI(object):
             warn.append('FPS xu ly %.1f < 20 (khong tinh render/JPEG)' % self._fps)
         rate = s['steer_flips'] / max(1.0, s['n'] / max(1.0, self._fps or 20.0))
         if rate > 3.0:
-            warn.append('lai doi dau %.1f lan/giay - giam Kp hoac trong so ngam'
-                        % rate)
+            tip = ('tang Tam ngam hoac giam Do nhay lai'
+                   if is_pp else 'giam Kp hoac trong so ngam')
+            warn.append('lai doi dau %.1f lan/giay - %s' % (rate, tip))
         banner = ''
         if warn:
             banner = ('<div style="color:#b00020"><b>Canh bao:</b> %s</div>'
@@ -2157,7 +2249,10 @@ class LaneTuningUI(object):
             return
         # Option B doi vung Ch0 on dinh. CV va model cu doi mask tam on dinh.
         if getattr(self.engine.lane, 'road_guided', False):
-            if not self.engine.lane.road_start_ready:
+            pp = getattr(self.engine, 'pure_pursuit', None)
+            ready = (pp.road_start_ready if pp is not None
+                     else self.engine.lane.road_start_ready)
+            if not ready:
                 self._log('TU CHOI CHAY: cho vung mat duong xanh noi den xe on dinh qua 5 frame.')
                 self._set_status('TU CHOI CHAY - vung xanh chua on dinh')
                 return
@@ -2325,16 +2420,132 @@ class LaneTuningUI(object):
     def _cfg_to_cua_som(curve_enter):
         return max(0.0, min(1.0, (0.30 - float(curve_enter)) / 0.24))
 
+    def _apply_pp_slider(self, key, val):
+        """Ap thanh chinh giao dien Pure Pursuit: dong bo v_max & tran servo doi xung."""
+        val = float(val)
+        if key == 'control.driver.steering_output_max':
+            self.engine.set_param('control.driver.steering_output_max', val)
+            self.engine.set_param('control.driver.steering_output_min', -val)
+            gain_abs = max(
+                1e-6, abs(float(self.engine.get_param('control.driver.steering_gain', -0.65))))
+            need_steer = min(1.0, round(val / gain_abs, 3))
+            self.engine.set_param('control.steer_max', need_steer)
+            self.engine.set_param('control.corner_steer_max', need_steer)
+        else:
+            self.engine.set_param(key, val)
+            if key in ('control.v_straight', 'control.v_corner'):
+                v_str = float(self.engine.get_param('control.v_straight', 0.30))
+                v_cor = float(self.engine.get_param('control.v_corner', 0.12))
+                hi = max(v_str, v_cor)
+                cur_vmax = float(self.engine.get_param('control.v_max', 0.35))
+                if hi > cur_vmax:
+                    self.engine.set_param('control.v_max', round(min(1.0, hi * 1.15), 3))
+                cur_vmin = float(self.engine.get_param('control.v_min', 0.10))
+                if v_cor < cur_vmin:
+                    self.engine.set_param('control.v_min', round(max(0.0, v_cor), 3))
+
+    def _build_pp_sliders(self):
+        """Bo 5 thanh rut gon cho tab Dieu khien (simple=False) khi dung Pure Pursuit."""
+        w = self.widgets
+        rows = []
+        for key, label, lo, hi, step in PURE_PURSUIT_PARAMS:
+            cur = float(self.engine.get_param(key, (lo + hi) * 0.5))
+            sl = w.FloatSlider(
+                value=cur, min=float(lo), max=float(hi), step=float(step),
+                description=label, readout_format='.2f', continuous_update=False,
+                style={'description_width': '160px'},
+                layout=w.Layout(width='420px'))
+
+            def _make_obs(k):
+                def _h(change):
+                    with self._engine_lock:
+                        self._apply_pp_slider(k, change['new'])
+                return _h
+
+            sl.observe(_make_obs(key), names='value')
+            self._sliders[key] = sl
+            rows.append(sl)
+        return w.VBox(rows)
+
     def _build_simple_panel(self):
-        """Bon num. Moi num viet mot NHOM khoa di lien voi nhau."""
+        """Bang chinh don gian — rut gon dung 5 thanh chinh khi dung Pure Pursuit."""
         w = self.widgets
         g = self.engine.get_param
-        # Nhan hep lai va slider ngan lai de o doc so KHONG bi cot phai cat mat.
-        # Truoc day nhan 150px + slider 440px bi tran ra ngoai cot, nguoi dung
-        # chi thay mot chu so o ria.
         L = dict(style={'description_width': '128px'},
-                 layout=w.Layout(width='340px'),
+                 layout=w.Layout(width='350px'),
                  readout_format='.2f', continuous_update=False)
+
+        if getattr(self.engine, 'control_mode', 'corner') == 'pure_pursuit':
+            sl_vstr = w.FloatSlider(
+                value=float(g('control.v_straight', 0.30)),
+                min=0.05, max=0.80, step=0.01, description='TOC DO thang', **L)
+            sl_vcor = w.FloatSlider(
+                value=float(g('control.v_corner', 0.12)),
+                min=0.05, max=0.50, step=0.01, description='TOC DO cua', **L)
+            sl_srv = w.FloatSlider(
+                value=float(g('control.driver.steering_output_max', 0.40)),
+                min=0.30, max=0.85, step=0.05, description='DO CUA servo', **L)
+            sl_ld = w.FloatSlider(
+                value=float(g('control.pure_pursuit.lookahead_px', 84.0)),
+                min=50.0, max=140.0, step=2.0, description='TAM NGAM (px)', **L)
+            sl_gain = w.FloatSlider(
+                value=float(g('control.pure_pursuit.gain', 1.15)),
+                min=0.60, max=2.00, step=0.05, description='DO NHAY lai', **L)
+
+            notes = dict((k, w.HTML()) for k in ('vstr', 'vcor', 'srv', 'ld', 'gain'))
+
+            def _sub(html):
+                return ('<div style="margin:-8px 0 10px 132px;font-size:11px;'
+                        'color:#333;line-height:1.4">%s</div>' % html)
+
+            def _refresh_pp():
+                vstr = float(g('control.v_straight', 0.30))
+                vcor = float(g('control.v_corner', 0.12))
+                vmax = float(g('control.v_max', 0.35))
+                srv = float(g('control.driver.steering_output_max', 0.40))
+                ld = float(g('control.pure_pursuit.lookahead_px', 84.0))
+                gn = float(g('control.pure_pursuit.gain', 1.15))
+                notes['vstr'].value = _sub(
+                    'ga thang = <b>%.2f</b> &nbsp; (tran ga: <b>%.2f</b>)' % (vstr, vmax))
+                notes['vcor'].value = _sub(
+                    'ga trong cua = <b>%.2f</b> &nbsp; (giam neu xe vang ra ngoai cua)' % vcor)
+                notes['srv'].value = _sub(
+                    'tran servo = <b>&plusmn;%.2f</b> &nbsp; (mac dinh default.yaml: &plusmn;0.40)' % srv)
+                notes['ld'].value = _sub(
+                    'ngam truoc <b>%.0f px</b> &nbsp; (giam neu cua rong, tang neu thang lac)' % ld)
+                notes['gain'].value = _sub(
+                    'he so lai = <b>%.2f</b> &nbsp; (tang nhe neu be lai thieu)' % gn)
+
+            def _mk_pp(key):
+                def _h(change):
+                    with self._engine_lock:
+                        self._apply_pp_slider(key, change['new'])
+                    _refresh_pp()
+                return _h
+
+            for sl, key in (
+                (sl_vstr, 'control.v_straight'),
+                (sl_vcor, 'control.v_corner'),
+                (sl_srv, 'control.driver.steering_output_max'),
+                (sl_ld, 'control.pure_pursuit.lookahead_px'),
+                (sl_gain, 'control.pure_pursuit.gain'),
+            ):
+                sl.observe(_mk_pp(key), names='value')
+                self._sliders[key] = sl
+            _refresh_pp()
+
+            warn_srv = w.HTML(
+                '<div style="margin-top:4px;font-size:11px;color:#b00020;max-width:350px;line-height:1.45">'
+                '<b>Luu y DO CUA servo:</b> chi tang tung nac 0.05 khi da ke banh khoi mat dat; '
+                'nghe servo keu ken thi lui lai 1 nac.</div>')
+            return w.VBox([
+                sl_vstr, notes['vstr'],
+                sl_vcor, notes['vcor'],
+                sl_srv, notes['srv'],
+                sl_ld, notes['ld'],
+                sl_gain, notes['gain'],
+                warn_srv,
+            ])
 
         # Dai noi rong de dua toc do. Tran an toan that su van la
         # `control.v_max`, tu nang theo hai num nay.

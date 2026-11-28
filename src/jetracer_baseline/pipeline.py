@@ -28,9 +28,10 @@ from .camera import (LatestFrameGrabber, SyncGrabber,
 from .control.corner import CornerController
 from .control.driver import build_driver
 from .control.pid import PID
+from .control.pure_pursuit import RoadPurePursuitController
 from .logging_csv import RunLogger
 from .perception import build_lane_detector
-from .perception.lane import LaneDetector  # noqa: F401  giu cho code cu import
+from .perception.lane import LaneDetector, LaneResult  # noqa: F401  giu cho code cu import
 from .perception.shading import ShadingCorrector
 from .perception.signs import SignTracker, build_detector
 from .perception.stopline import StoplineDetector
@@ -241,6 +242,10 @@ class Runner(object):
             # Cung mot bo dieu khien voi giao dien tune -> tune xong chay that
             # khong bi lech hanh vi.
             self.corner = CornerController(cfg)
+            self.control_mode = str(cfg.get('control.mode', 'corner'))
+            self.pure_pursuit = (
+                RoadPurePursuitController(cfg)
+                if self.control_mode == 'pure_pursuit' else None)
             self.driver = build_driver(driver_kind, cfg)
             self.fsm = fsm_mod.DecisionFSM(cfg, task=task)
             self.motion = MotionEstimator(
@@ -361,11 +366,7 @@ class Runner(object):
                 else:
                     det_fps, stable = 0.0, None
 
-                # ---- Decision ---------------------------------------------
-                cmd = self.fsm.step(lane_res, stopline=stop_res, sign=stable,
-                                    moving=moving, now=loop_t0)
-
-                # ---- Control ----------------------------------------------
+                # ---- Decision & Control -----------------------------------
                 dt = loop_t0_mono - t_prev_mono
                 t_prev_mono = loop_t0_mono
                 # FPS = nhip THUC TE cua vong chinh (khoang cach giua hai lan lap),
@@ -373,20 +374,36 @@ class Runner(object):
                 # so bi thoi phong nhieu lan va khong the bao ve truoc BTC.
                 if frames > 0:
                     self.fps_meter.tick(max(1e-6, dt))
-                # Tron lech tai muc xe voi lech tai diem ngam xa. Chi dung
-                # cte thi xe luon sua MUON o cua: den luc CTE tang du de PID
-                # phan ung thi xe da an vao mep lane roi.
-                look_w = self.corner.effective_lookahead_weight(self.steer_look_w)
-                err = ((1.0 - look_w) * lane_res.cte
-                       + look_w * lane_res.cte_lookahead)
-                pid_out = self.pid.step(err, dt)
-                road_turn = getattr(self.lane, 'last_road_turn', 0)
-                if not lane_res.found or lane_res.cte_lookahead * road_turn <= 0.0:
-                    road_turn = 0
-                steer, throttle, drive_mode = self.corner.step(
-                    pid_out, lane_res.cte, lane_res.curvature, dt,
-                    lane_found=lane_res.found, road_turn=road_turn,
-                    cte_lookahead=lane_res.cte_lookahead)
+
+                if (self.pure_pursuit is not None and
+                        getattr(self.lane, 'last_road_logits', None) is not None):
+                    pp_out = self.pure_pursuit.step(self.lane.last_road_logits, dt)
+                    steer = pp_out['steer']
+                    throttle = pp_out['throttle']
+                    drive_mode = pp_out['mode']
+                    lane_res = LaneResult(
+                        pp_out['found'], pp_out['cte'], pp_out['curvature'],
+                        lane_res.n_pixels, None,
+                        cte_lookahead=pp_out['lookahead'], n_bands=pp_out['n_bands'])
+                    cmd = self.fsm.step(lane_res, stopline=stop_res, sign=stable,
+                                        moving=moving, now=loop_t0)
+                else:
+                    cmd = self.fsm.step(lane_res, stopline=stop_res, sign=stable,
+                                        moving=moving, now=loop_t0)
+                    # Tron lech tai muc xe voi lech tai diem ngam xa. Chi dung
+                    # cte thi xe luon sua MUON o cua: den luc CTE tang du de PID
+                    # phan ung thi xe da an vao mep lane roi.
+                    look_w = self.corner.effective_lookahead_weight(self.steer_look_w)
+                    err = ((1.0 - look_w) * lane_res.cte
+                           + look_w * lane_res.cte_lookahead)
+                    pid_out = self.pid.step(err, dt)
+                    road_turn = getattr(self.lane, 'last_road_turn', 0)
+                    if not lane_res.found or lane_res.cte_lookahead * road_turn <= 0.0:
+                        road_turn = 0
+                    steer, throttle, drive_mode = self.corner.step(
+                        pid_out, lane_res.cte, lane_res.curvature, dt,
+                        lane_found=lane_res.found, road_turn=road_turn,
+                        cte_lookahead=lane_res.cte_lookahead)
 
                 if cmd.steer_override is not None:
                     steer = max(-self.steer_max,

@@ -3218,6 +3218,90 @@ def test_lane_cnn_edge_guard_and_off_road_recovery():
     assert res_rec.found and det.last_edge_guard > 0.10 and res_rec.cte > 0.25
 
 
+def test_road_pure_pursuit_controller_and_config():
+    """Kiem tra RoadPurePursuitController giu nguyen default.yaml, re dung huong & ne lo vat can."""
+    from jetracer_baseline.control.pure_pursuit import RoadPurePursuitController
+    from jetracer_baseline.perception.lane_cnn import SEG_H, SEG_W
+
+    pp_yaml = os.path.join(ROOT, 'configs', 'road_pure_pursuit.yaml')
+    cfg = load_config(CONFIG, [pp_yaml])
+    # Khong duoc pha vo cac gioi han co dinh cua default.yaml
+    assert cfg.get('control.driver.steering_output_min') == -0.40
+    assert cfg.get('control.driver.steering_output_max') == 0.40
+    assert cfg.get('control.driver.steering_gain') == -0.65
+    assert cfg.get('control.v_straight') == 0.30
+    assert cfg.get('control.v_corner') == 0.12
+    assert cfg.get('control.mode') == 'pure_pursuit'
+    assert cfg.get('lane.cnn.road_only') is True
+
+    ctrl = RoadPurePursuitController(cfg)
+    # 1. Duong thang giua anh -> lai gan 0, road_start_ready sau 5 frame
+    seg_str = np.full((SEG_H, SEG_W), -5.0, dtype=np.float32)
+    seg_str[:, 34:94] = 5.0
+    for _ in range(6):
+        out = ctrl.step(seg_str, 1.0 / 30.0)
+    assert out['found'] and ctrl.road_start_ready
+    assert abs(out['steer']) < 0.08
+    assert abs(out['steer']) <= 0.60 + 1e-6
+
+    # 2. Cua sang PHAI o phan tren -> lai duong (re phai) va trong gioi han steer_max
+    ctrl.reset()
+    seg_r = np.full((SEG_H, SEG_W), -5.0, dtype=np.float32)
+    for y in range(SEG_H):
+        t = float(SEG_H - 1 - y) / float(SEG_H)
+        cx = int(64 + 34 * (t ** 1.6))
+        seg_r[y, max(0, cx - 28):min(SEG_W, cx + 28)] = 5.0
+    for _ in range(5):
+        out_r = ctrl.step(seg_r, 1.0 / 30.0)
+    assert out_r['found'] and out_r['steer'] > 0.12
+    assert out_r['steer'] <= 0.60 + 1e-6
+
+    # 3. Vat can tao lo lon ben TRAI mat duong -> giu lo (obstacle_hole=True) va ne sang PHAI
+    ctrl.reset()
+    seg_obs = np.full((SEG_H, SEG_W), -5.0, dtype=np.float32)
+    seg_obs[:, 24:104] = 5.0
+    seg_obs[20:42, 34:64] = -5.0   # lo vat can lon phia ben trai -> khe trong ben phai
+    for _ in range(5):
+        out_obs = ctrl.step(seg_obs, 1.0 / 30.0)
+    assert out_obs['found'] and out_obs['obstacle_hole']
+    assert out_obs['steer'] > 0.08, 'phai ne sang phai khi vat can nam ben trai, got %.3f' % out_obs['steer']
+
+    # 4. CnnLaneDetector o che do road_only phai ho tro ca output 1 kenh (pruned ONNX/TRT)
+    from jetracer_baseline.perception.lane_cnn import CnnLaneDetector, PROC_H, PROC_W
+    cfg.set('lane.cnn.engine', '')
+    det = CnnLaneDetector(cfg)
+
+    class _Fake1Ch(object):
+        def infer(self, _x):
+            return {'seg': seg_str.reshape(1, 1, SEG_H, SEG_W)}
+
+    det.engine = _Fake1Ch()
+    res1 = det.process(np.zeros((PROC_H, PROC_W, 3), dtype=np.uint8), compute_bev=False)
+    assert res1.found and det.road_guided
+    assert det.last_road_logits is not None and det.last_road_logits.shape == (SEG_H, SEG_W)
+
+    # 5. Giao dien dieu khien Pure Pursuit rut gon con dung 5 thanh thuc te
+    from jetracer_baseline.tuning_ui import PURE_PURSUIT_PARAMS
+    assert [row[0] for row in PURE_PURSUIT_PARAMS] == [
+        'control.v_straight',
+        'control.v_corner',
+        'control.driver.steering_output_max',
+        'control.pure_pursuit.lookahead_px',
+        'control.pure_pursuit.gain',
+    ]
+    ui_fake = LaneTuningUI.__new__(LaneTuningUI)
+    eng = LaneTuningEngine(CONFIG)
+    eng.cfg = cfg
+    eng.rebuild()
+    ui_fake.engine = eng
+    ui_fake._apply_pp_slider('control.driver.steering_output_max', 0.50)
+    assert abs(ui_fake.engine.get_param('control.driver.steering_output_min') + 0.50) < 1e-6
+    assert abs(ui_fake.engine.get_param('control.driver.steering_output_max') - 0.50) < 1e-6
+    assert ui_fake.engine.get_param('control.steer_max') > 0.70
+    ui_fake._apply_pp_slider('control.v_straight', 0.45)
+    assert ui_fake.engine.get_param('control.v_max') >= 0.45
+
+
 if __name__ == '__main__':
     failures = 0
     for name, fn in sorted(list(globals().items())):

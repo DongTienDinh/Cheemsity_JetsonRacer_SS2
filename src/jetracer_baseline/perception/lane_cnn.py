@@ -325,6 +325,7 @@ class CnnLaneDetector(object):
         self.last_total_ms = 0.0
         self.last_mask = None        # mask ROI 256x128 dung de fit (centerline hoac fallback)
         self.last_road_mask = None   # Option B Ch0 (64x128) neu model 3 kenh
+        self.last_road_logits = None # Option B Ch0 float32 logits (64x128) cho Pure Pursuit
         self.last_used_fallback = False
         self.last_road_turn = 0
         self.last_edge_guard = 0.0
@@ -365,6 +366,7 @@ class CnnLaneDetector(object):
         # Dem an toan chong cham vach trang o vung gan dau xe (BEV px & he so day).
         self.edge_guard_px = float(c('lane.cnn.edge_guard_px', 42.0))
         self.edge_guard_gain = float(c('lane.cnn.edge_guard_gain', 0.45))
+        self.road_only = bool(c('lane.cnn.road_only', False))
 
     def _reset_state(self):
         self._cte = 0.0
@@ -837,8 +839,17 @@ class CnnLaneDetector(object):
 
     def _process_road_guided(self, seg3, reg, preview, t0):
         road_logits, center_logits = seg3[0], seg3[2]
+        self.last_road_logits = road_logits
         self.last_road_mask = self.last_mask = self.last_bev = None
         self.last_edge_guard = 0.0
+        if getattr(self, 'road_only', False):
+            # Che do chi dung Ch0 (cho RoadPurePursuitController): bo qua toan bo
+            # hau xu ly Ch2/fallback de toi uu FPS tren Jetson Nano.
+            if preview:
+                self.last_road_mask = (road_logits > 0.0).astype(np.uint8) * 255
+            self.last_total_ms = (time.perf_counter() - t0) * 1000.0
+            return LaneResult(True, 0.0, 0.0, int(np.count_nonzero(road_logits > 0.0)),
+                              None, cte_lookahead=0.0, n_bands=10)
         co, t_max, n_bands, npix = self._mask_to_fit_lut(center_logits)
         raw = self._fit_values(co, t_max) if co is not None else None
         if self._cte_disagrees(raw, reg):
@@ -904,6 +915,20 @@ class CnnLaneDetector(object):
         seg, reg = self._pick_outputs(outs)
         self.last_used_fallback = False
         self.last_road_turn = 0
+        if getattr(self, 'road_only', False):
+            self.road_guided = True
+            if seg.size == 3 * SEG_H * SEG_W:
+                road_logits = seg.reshape(3, SEG_H, SEG_W)[0]
+            else:
+                road_logits = seg.reshape(SEG_H, SEG_W)
+            self.last_road_logits = road_logits
+            self.last_mask = None
+            self.last_bev = None
+            self.last_road_mask = (
+                (road_logits > 0.0).astype(np.uint8) * 255 if compute_bev else None)
+            self.last_total_ms = (time.perf_counter() - t0) * 1000.0
+            return LaneResult(True, 0.0, 0.0, int(np.count_nonzero(road_logits > 0.0)),
+                              None, cte_lookahead=0.0, n_bands=10)
         self.road_guided = seg.size == 3 * SEG_H * SEG_W
         if self.road_guided:
             return self._process_road_guided(seg.reshape(3, SEG_H, SEG_W), reg, compute_bev, t0)

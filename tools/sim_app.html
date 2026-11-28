@@ -1,0 +1,934 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>JetRacer FA2026 — Local ONNX Track Simulator</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #1e293b;
+      --panel2: #162033;
+      --border: #334155;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --green: #22c55e;
+      --amber: #f59e0b;
+      --red: #ef4444;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 13px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 16px;
+      background: #0b1220;
+      border-bottom: 1px solid var(--border);
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+  .form-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  label.field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--muted);
+    font-weight: 600;
+  }
+  select {
+    background: var(--panel2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 12px;
+  }
+  .sliders {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px 14px;
+    margin-top: 8px;
+  }
+  .slider-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .slider-head {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: #cbd5e1;
+  }
+  .slider-head .val {
+    font-family: ui-monospace, Consolas, monospace;
+    color: var(--accent);
+    font-weight: 700;
+  }
+  input[type="range"] {
+    width: 100%;
+    accent-color: var(--accent);
+    margin: 0;
+  }
+  .preset-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 8px;
+  }
+  .legend-dots {
+    display: flex;
+    gap: 10px;
+    font-size: 11px;
+    align-items: center;
+  }
+  .dot {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    margin-right: 3px;
+  }
+  .checks {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    font-size: 11px;
+    color: #cbd5e1;
+  }
+  .checks input { accent-color: var(--accent); }
+  .slider-desc {
+    font-size: 10px;
+    color: var(--muted);
+    line-height: 1.35;
+  }
+  .ctrl-note {
+    background: #0b1220;
+    border: 1px dashed #334155;
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin-top: 8px;
+    font-size: 11px;
+    color: #94a3b8;
+  }
+  details.adv-box {
+    margin-top: 10px;
+    border-top: 1px solid #334155;
+    padding-top: 8px;
+  }
+  details.adv-box > summary {
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 700;
+    color: #94a3b8;
+    user-select: none;
+    list-style: none;
+  }
+  details.adv-box > summary::-webkit-details-marker { display: none; }
+  details.adv-box > summary:hover { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>
+    JetRacer FA2026 — Local ONNX Track Simulator
+    <span class="pill">ROAD-ONLY (Ch0) • NO WHITE / NO LIDAR</span>
+  </h1>
+  <div style="display:flex;gap:8px;align-items:center;">
+    <span id="statusPill" class="pill ok">Sẵn sàng</span>
+    <span id="nanoFpsPill" class="pill">Jetson Nano: --</span>
+  </div>
+</header>
+
+    .pill {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-weight: 600;
+      background: #1e3a5f;
+      color: #7dd3fc;
+      border: 1px solid #0284c7;
+    }
+
+    .pill.warn {
+      background: #451a03;
+      color: #fcd34d;
+      border-color: #d97706;
+    }
+
+    .pill.err {
+      background: #450a0a;
+      color: #fca5a5;
+      border-color: #dc2626;
+    }
+
+    .pill.ok {
+      background: #052e16;
+      color: #86efac;
+      border-color: #16a34a;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(520px, 1.15fr) minmax(440px, 1fr);
+      gap: 12px;
+      padding: 12px;
+      max-width: 1720px;
+      margin: 0 auto;
+    }
+
+      <!-- THANH CHINH CHINH RUT GON (TOC DO THANG, TOC DO CUA, DO CUA SERVO, TAM NGAM, DO NHAY) -->
+      <div id="ctrlGroupDrive" class="sliders">
+        <div class="slider-item">
+          <div class="slider-head"><span>1. Tốc độ thẳng</span><span class="val" id="v_v_straight">0.30</span></div>
+          <input type="range" id="s_v_straight" min="0.05" max="0.80" step="0.01" value="0.30" />
+        </div>
+        <div class="slider-item">
+          <div class="slider-head"><span>2. Tốc độ trong cua</span><span class="val" id="v_v_corner">0.12</span></div>
+          <input type="range" id="s_v_corner" min="0.05" max="0.50" step="0.01" value="0.12" />
+        </div>
+        <div class="slider-item">
+          <div class="slider-head"><span>3. Độ cua servo (±)</span><span class="val" id="v_servo_limit">0.40</span></div>
+          <input type="range" id="s_servo_limit" min="0.30" max="0.85" step="0.05" value="0.40" />
+        </div>
+        <div class="slider-item" id="wrap_pp_lookahead">
+          <div class="slider-head"><span>4. Tầm ngắm cua (px)</span><span class="val" id="v_pp_lookahead_px">84</span></div>
+          <input type="range" id="s_pp_lookahead_px" min="50" max="140" step="2" value="84" />
+        </div>
+        <div class="slider-item" id="wrap_pp_gain">
+          <div class="slider-head"><span>5. Độ nhạy lái (Gain)</span><span class="val" id="v_pp_gain">1.15</span></div>
+          <input type="range" id="s_pp_gain" min="0.60" max="2.00" step="0.05" value="1.15" />
+        </div>
+        <div class="slider-item" id="wrap_ftg_gain" style="display:none;">
+          <div class="slider-head"><span>4. Follow-Gap Gain</span><span class="val" id="v_ftg_gain">1.25</span></div>
+          <input type="range" id="s_ftg_gain" min="0.60" max="2.20" step="0.05" value="1.25" />
+        </div>
+        <div class="slider-item" id="wrap_ftg_bubble" style="display:none;">
+          <div class="slider-head"><span>5. Follow-Gap Bubble (tia né đỏ)</span><span class="val" id="v_ftg_bubble">5</span></div>
+          <input type="range" id="s_ftg_bubble" min="1" max="8" step="1" value="5" />
+        </div>
+        <div class="slider-item" style="justify-content:flex-end;">
+          <button id="btnResetDefaults" class="small" style="width:fit-content;">↺ Về mặc định default.yaml</button>
+        </div>
+      </div>
+
+      <div id="ctrlGroupOld" class="ctrl-note" style="display:none;">
+        Đang mô phỏng đúng bộ tham số cố định của code cũ (<code>configs/default.yaml</code> + <code>lane_cnn.py</code> + <code>CornerController</code>).
+      </div>
+
+      <!-- THAM SO MO PHONG VAT LY / ANH SANG (THU GON DE GIAO DIEN GỌN) -->
+      <details class="adv-box">
+        <summary>▸ Tùy chọn mô phỏng nâng cao (góc bánh vật lý, độ trễ, kích thước xe, bóng/chói)</summary>
+        <div class="sliders">
+          <div class="slider-item">
+            <div class="slider-head"><span>Góc bánh vật lý ở mốc ±0.40 (°)</span><span class="val" id="v_wheel_deg_at_limit">34</span></div>
+            <input type="range" id="s_wheel_deg_at_limit" min="18" max="42" step="1" value="34" />
+          </div>
+          <div class="slider-item">
+            <div class="slider-head"><span>Độ trễ pipeline (frames @ 30Hz)</span><span class="val" id="v_latency_frames">1</span></div>
+            <input type="range" id="s_latency_frames" min="0" max="5" step="1" value="1" />
+          </div>
+          <div class="slider-item">
+            <div class="slider-head"><span>Chiều dài xe (px, chữ START = 76)</span><span class="val" id="v_car_length">76</span></div>
+            <input type="range" id="s_car_length" min="44" max="96" step="2" value="76" />
+          </div>
+          <div class="slider-item">
+            <div class="slider-head"><span>Bề rộng xe (px, chữ START = 21)</span><span class="val" id="v_car_width">21</span></div>
+            <input type="range" id="s_car_width" min="16" max="42" step="1" value="21" />
+          </div>
+          <div class="slider-item">
+            <div class="slider-head"><span>Giả lập bóng đổ (Shadow)</span><span class="val" id="v_shadow">0.00</span></div>
+            <input type="range" id="s_shadow" min="0.00" max="1.00" step="0.05" value="0.00" />
+          </div>
+          <div class="slider-item">
+            <div class="slider-head"><span>Giả lập chói đèn (Glare)</span><span class="val" id="v_glare">0.00</span></div>
+            <input type="range" id="s_glare" min="0.00" max="1.00" step="0.05" value="0.00" />
+          </div>
+        </div>
+      </details>
+    </div>
+
+    <!-- RIGHT COLUMN: PROJECT-STYLE 2x2 CAMERA PANEL + TELEMETRY -->
+    <div>
+      <div class="card">
+        <div class="card-title">
+          <span>Góc nhìn Camera + Detect ONNX + BEV + Đồ thị (giống tuning_ui.py)</span>
+          <span id="hardLimBadge" class="pill" style="display:none;">HARD-LIMIT</span>
+        </div>
+        <img id="panelImg" alt="Camera & ONNX panel" />
+      </div>
+
+      <div class="card">
+        <div class="card-title">
+          <span>Thông số thời gian thực &amp; Chấm điểm vòng chạy</span>
+        </div>
+        <div class="metrics-grid">
+          <div class="metric">
+            <div class="k">ONNX CPU (ms)</div>
+            <div class="v" id="mInfer">--</div>
+          </div>
+          <div class="metric">
+            <div class="k">Road IoU (Ch0)</div>
+            <div class="v ok" id="mIou">--</div>
+          </div>
+          <div class="metric">
+            <div class="k">Tiến độ vòng</div>
+            <div class="v" id="mProg">0%</div>
+          </div>
+          <div class="metric">
+            <div class="k">Vòng / Thời gian</div>
+            <div class="v" id="mLap">0 / 0.0s</div>
+          </div>
+          <div class="metric">
+            <div class="k">Lệnh lái / Servo</div>
+            <div class="v" id="mSteer">0 / 0</div>
+          </div>
+          <div class="metric">
+            <div class="k">Ga / Chế độ</div>
+            <div class="v" id="mMode">0 / --</div>
+          </div>
+          <div class="metric">
+            <div class="k">Chạm vạch (%)</div>
+            <div class="v ok" id="mOff">0.0%</div>
+          </div>
+          <div class="metric">
+            <div class="k">Vào đỏ / Va vật cản</div>
+            <div class="v ok" id="mRed">0.0% / 0</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('mapCanvas');
+    const ctx = canvas.getContext('2d');
+    const panelImg = document.getElementById('panelImg');
+
+    let mapImg = new Image();
+    let mapLoaded = false;
+    let simState = null;
+    let trail = [];
+    let modelsMeta = [];
+    let running = false;
+    let manualMode = false;
+    let obsPlaceMode = false;
+    let obstacles = [];
+    let busy = false;
+    let keys = {};
+
+    // Drag-to-place car on map
+    let dragging = false;
+    let dragStart = null;
+    let dragCur = null;
+
+const SLIDER_IDS = [
+  'v_straight', 'v_corner', 'servo_limit',
+  'pp_lookahead_px', 'pp_gain', 'ftg_gain', 'ftg_bubble',
+  'wheel_deg_at_limit', 'latency_frames',
+  'car_length', 'car_width', 'shadow', 'glare'
+];
+
+function updateControllerControls() {
+  const c = document.getElementById('selController').value;
+  const isOld = (c === 'project_current');
+  const isPP = (c === 'road_pure_pursuit');
+  const isFTG = (c === 'road_ftg');
+  document.getElementById('ctrlGroupDrive').style.display = isOld ? 'none' : '';
+  document.getElementById('ctrlGroupOld').style.display = isOld ? '' : 'none';
+  document.getElementById('wrap_pp_lookahead').style.display = isPP ? '' : 'none';
+  document.getElementById('wrap_pp_gain').style.display = isPP ? '' : 'none';
+  document.getElementById('wrap_ftg_gain').style.display = isFTG ? '' : 'none';
+  document.getElementById('wrap_ftg_bubble').style.display = isFTG ? '' : 'none';
+}
+let fixedDefault = null;
+
+    async function api(path, body = null) {
+      const opt = body === null ? { method: 'GET' } : {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      };
+      const r = await fetch(path, opt);
+      const j = await r.json();
+      if (!r.ok || j.error) throw new Error(j.error || ('HTTP ' + r.status));
+      return j;
+    }
+
+    function setStatus(txt, cls = 'ok') {
+      const el = document.getElementById('statusPill');
+      el.textContent = txt;
+      el.className = 'pill ' + cls;
+    }
+
+    function updateNanoHint() {
+      const name = document.getElementById('selModel').value;
+      const m = modelsMeta.find(x => x.name === name);
+      document.getElementById('nanoFpsPill').textContent =
+        m ? `Jetson Nano TRT FP16: ${m.nano_fps} (${m.size_kb} KB)` : 'Jetson Nano: --';
+    }
+
+    function syncSlidersFromParams(p) {
+      for (const k of SLIDER_IDS) {
+        if (p[k] === undefined) continue;
+        const el = document.getElementById('s_' + k);
+        const vl = document.getElementById('v_' + k);
+        if (el) el.value = p[k];
+        if (vl) vl.textContent = Number.isInteger(Number(el.step)) ? String(Math.round(p[k])) : Number(p[k]).toFixed(2);
+      }
+    }
+
+    function collectParams() {
+      const p = {};
+      for (const k of SLIDER_IDS) {
+        const el = document.getElementById('s_' + k);
+        if (el) p[k] = Number(el.value);
+      }
+      return p;
+    }
+
+    function applyState(st, replaceTrail = null) {
+      simState = st;
+      if (st && Array.isArray(st.obstacles)) {
+        obstacles = st.obstacles;
+      }
+      if (replaceTrail !== null) {
+        trail = replaceTrail.slice();
+      } else if (st && st.trail_tail) {
+        trail.push(st.trail_tail);
+        if (trail.length > 3000) trail.shift();
+      }
+      if (st && st.panel) {
+        panelImg.src = st.panel;
+      }
+      if (st && st.telemetry) {
+        const t = st.telemetry;
+        document.getElementById('mInfer').textContent = t.infer_ms.toFixed(1) + ' ms';
+        const iouEl = document.getElementById('mIou');
+        iouEl.textContent = (t.road_iou * 100).toFixed(1) + '%';
+        iouEl.className = 'v ' + (t.road_iou >= 0.88 ? 'ok' : (t.road_iou >= 0.72 ? 'warn' : 'err'));
+
+        document.getElementById('mProg').textContent = t.progress_pct.toFixed(0) + '%';
+        const lapTxt = t.last_lap_time ? `${t.laps_done} (${t.last_lap_time}s)` : `${t.laps_done} / ${t.sim_time.toFixed(1)}s`;
+        document.getElementById('mLap').textContent = lapTxt;
+
+        const stEl = document.getElementById('mSteer');
+        stEl.textContent = `${t.steer >= 0 ? '+' : ''}${t.steer.toFixed(2)} / ${t.servo >= 0 ? '+' : ''}${t.servo.toFixed(2)}`;
+        stEl.className = 'v ' + (t.servo_clipped ? 'err' : 'ok');
+
+        document.getElementById('mMode').textContent = `${t.throttle.toFixed(2)} / ${t.mode}`;
+
+        const offEl = document.getElementById('mOff');
+        offEl.textContent = t.off_road_pct.toFixed(1) + '%';
+        offEl.className = 'v ' + (t.off_road_pct === 0 ? 'ok' : (t.off_road_pct < 5 ? 'warn' : 'err'));
+
+        const redEl = document.getElementById('mRed');
+        const colSteps = t.collision_steps || 0;
+        redEl.textContent = `${t.in_red_pct.toFixed(1)}% / ${colSteps}`;
+        redEl.className = 'v ' + (t.in_red_pct === 0 && colSteps === 0 ? 'ok' : 'err');
+
+        const hb = document.getElementById('hardLimBadge');
+        hb.style.display = t.servo_clipped ? 'inline-block' : 'none';
+        hb.className = 'pill err';
+
+        if (t.out_of_bounds && running) {
+          running = false;
+          updatePlayBtn();
+          setStatus('Xe ra khỏi sa bàn — đã dừng', 'err');
+        } else if (t.laps_done >= 1 && t.last_lap_time) {
+          setStatus(`Hoàn thành vòng! (${t.last_lap_time}s | Chạm vạch ${t.off_road_pct}%)`, t.in_red_pct === 0 ? 'ok' : 'warn');
+        }
+      }
+      drawMap();
+    }
+
+    function drawMap() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (mapLoaded) {
+        ctx.drawImage(mapImg, 0, 0, canvas.width, canvas.height);
+      }
+      if (!simState) return;
+
+      // 1. Draw Camera FOV polygon
+      if (document.getElementById('chkFov').checked && simState.fov_poly) {
+        const p = simState.fov_poly;
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(p[0][0], p[0][1]);
+        for (let i = 1; i < p.length; i++) ctx.lineTo(p[i][0], p[i][1]);
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(56, 189, 248, 0.16)';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(56, 189, 248, 0.75)';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // 2. Draw BEV trapezoid
+      if (document.getElementById('chkBev').checked && simState.bev_poly) {
+        const p = simState.bev_poly;
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(p[0][0], p[0][1]);
+        for (let i = 1; i < p.length; i++) ctx.lineTo(p[i][0], p[i][1]);
+        ctx.closePath();
+        ctx.setLineDash([5, 4]);
+        ctx.strokeStyle = 'rgba(250, 204, 21, 0.85)';
+        ctx.lineWidth = 1.6;
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // 3. Draw trajectory trail colored by violation status
+      if (document.getElementById('chkTrail').checked && trail.length >= 2) {
+        ctx.save();
+        ctx.lineWidth = 3.2;
+        ctx.lineCap = 'round';
+        for (let i = 1; i < trail.length; i++) {
+          const a = trail[i - 1], b = trail[i];
+          if (Math.hypot(b[0] - a[0], b[1] - a[1]) > 80) continue;
+          ctx.beginPath();
+          ctx.moveTo(a[0], a[1]);
+          ctx.lineTo(b[0], b[1]);
+          ctx.strokeStyle = b[2] === 0 ? '#22c55e' : (b[2] === 1 ? '#f59e0b' : '#ef4444');
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+
+      // 3b. Draw static obstacles on track
+      if (obstacles && obstacles.length > 0) {
+        ctx.save();
+        for (const o of obstacles) {
+          ctx.beginPath();
+          ctx.arc(o.x, o.y, o.r + 2, 0, Math.PI * 2);
+          ctx.fillStyle = '#ffffff';
+          ctx.fill();
+          ctx.beginPath();
+          ctx.arc(o.x, o.y, o.r, 0, Math.PI * 2);
+          ctx.fillStyle = '#f97316';
+          ctx.fill();
+          ctx.strokeStyle = '#7c2d12';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.arc(o.x, o.y, Math.max(2, o.r * 0.42), 0, Math.PI * 2);
+          ctx.fillStyle = '#fef3c7';
+          ctx.fill();
+        }
+        ctx.restore();
+      }
+
+      // 4. Draw Pure Pursuit / FTG target point on map
+      const car = simState.car;
+      if (simState.target_map) {
+        const [tx, ty] = simState.target_map;
+        ctx.save();
+        ctx.beginPath();
+        ctx.setLineDash([4, 4]);
+        ctx.moveTo(car.x, car.y);
+        ctx.lineTo(tx, ty);
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 1.8;
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.arc(tx, ty, 6, 0, Math.PI * 2);
+        ctx.fillStyle = '#38bdf8';
+        ctx.fill();
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // 5. Draw Car (exact START dimensions + steered front wheels!)
+      ctx.save();
+      ctx.translate(car.x, car.y);
+      ctx.rotate(car.theta);
+      const hl = car.length * 0.5;
+      const hw = car.width * 0.5;
+
+      // Chassis body
+      ctx.fillStyle = (car.in_red_any || car.collided_obs) ? 'rgba(239, 68, 68, 0.92)' :
+        (car.on_road_all ? 'rgba(34, 197, 94, 0.90)' : 'rgba(245, 158, 11, 0.90)');
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.roundRect(-hl, -hw, car.length, car.width, 4);
+      ctx.fill();
+      ctx.stroke();
+
+      // Front direction arrow / windshield
+      ctx.fillStyle = '#0f172a';
+      ctx.beginPath();
+      ctx.moveTo(hl - 4, 0);
+      ctx.lineTo(hl - 16, -hw + 4);
+      ctx.lineTo(hl - 16, hw - 4);
+      ctx.closePath();
+      ctx.fill();
+
+      // Rear wheels
+      ctx.fillStyle = '#0f172a';
+      ctx.fillRect(-hl + 6, -hw - 3, 14, 4);
+      ctx.fillRect(-hl + 6, hw - 1, 14, 4);
+
+      // Articulated Front wheels showing actual Ackermann wheel_angle
+      for (const wy of [-hw - 1, hw + 1]) {
+        ctx.save();
+        ctx.translate(hl - 14, wy);
+        ctx.rotate(car.wheel_angle);
+        ctx.fillStyle = '#facc15';
+        ctx.fillRect(-7, -2.5, 14, 5);
+        ctx.restore();
+      }
+      ctx.restore();
+
+      // 6. Drag arrow when placing car manually
+      if (dragging && dragStart && dragCur) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(dragStart.x, dragStart.y);
+        ctx.lineTo(dragCur.x, dragCur.y);
+        ctx.strokeStyle = '#facc15';
+        ctx.lineWidth = 3;
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(dragStart.x, dragStart.y, 7, 0, Math.PI * 2);
+        ctx.fillStyle = '#facc15';
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    function updatePlayBtn() {
+      const b = document.getElementById('btnPlay');
+      if (running) {
+        b.textContent = '⏸ TẠM DỪNG';
+        b.className = 'danger';
+      } else {
+        b.textContent = '▶ CHẠY TỰ ĐỘNG';
+        b.className = 'success';
+      }
+    }
+
+    async function simLoop() {
+      if (!running && !manualMode) return;
+      if (busy) {
+        requestAnimationFrame(simLoop);
+        return;
+      }
+      busy = true;
+      try {
+        let body = { move: true, steps: 1 };
+        if (manualMode) {
+          let ms = 0.0, mt = 0.0;
+          const vStr = fixedDefault ? fixedDefault.v_straight : 0.30;
+          const sMax = fixedDefault ? fixedDefault.steer_max : 0.60;
+          if (keys['KeyW'] || keys['ArrowUp']) mt = vStr;
+          if (keys['KeyS'] || keys['ArrowDown']) mt = -0.15;
+          if (keys['KeyA'] || keys['ArrowLeft']) ms = -sMax;
+          if (keys['KeyD'] || keys['ArrowRight']) ms = sMax;
+          body.manual_steer = ms;
+          body.manual_throttle = mt;
+          body.move = (mt !== 0.0);
+        }
+        const st = await api('/api/step', body);
+        applyState(st);
+      } catch (e) {
+        running = false;
+        updatePlayBtn();
+        setStatus('Lỗi: ' + e.message, 'err');
+      } finally {
+        busy = false;
+      }
+      if (running || manualMode) {
+        setTimeout(simLoop, 25);
+      }
+    }
+
+    async function pushConfig() {
+      try {
+        setStatus('Đang áp cấu hình...', 'warn');
+        const res = await api('/api/config', {
+          model: document.getElementById('selModel').value,
+          controller: document.getElementById('selController').value,
+          params: collectParams(),
+        });
+        updateNanoHint();
+        applyState(res.state);
+        setStatus('Đã cập nhật cấu hình', 'ok');
+      } catch (e) {
+        setStatus('Lỗi config: ' + e.message, 'err');
+      }
+    }
+
+    function mapCoordsFromEvent(ev) {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: (ev.clientX - rect.left) * (canvas.width / rect.width),
+        y: (ev.clientY - rect.top) * (canvas.height / rect.height),
+      };
+    }
+
+    canvas.addEventListener('mousedown', async (ev) => {
+      const pt = mapCoordsFromEvent(ev);
+      if (obsPlaceMode) {
+        try {
+          const r = Number(document.getElementById('s_obs_r').value);
+          const res = await api('/api/obstacles', { action: 'toggle_at', x: pt.x, y: pt.y, r });
+          obstacles = res.obstacles || [];
+          applyState(res.state);
+          setStatus(`Vật cản trên sân: ${obstacles.length} (click lần nữa để xóa)`, 'ok');
+        } catch (e) {
+          setStatus('Lỗi đặt vật cản: ' + e.message, 'err');
+        }
+        return;
+      }
+      dragging = true;
+      dragStart = pt;
+      dragCur = dragStart;
+      drawMap();
+    });
+    canvas.addEventListener('mousemove', (ev) => {
+      if (!dragging) return;
+      dragCur = mapCoordsFromEvent(ev);
+      drawMap();
+    });
+    window.addEventListener('mouseup', async () => {
+      if (!dragging) return;
+      dragging = false;
+      const dx = dragCur.x - dragStart.x;
+      const dy = dragCur.y - dragStart.y;
+      const theta = Math.hypot(dx, dy) > 8 ? Math.atan2(dy, dx) : (simState ? simState.car.theta : Math.PI);
+      try {
+        const r = await api('/api/reset', { x: dragStart.x, y: dragStart.y, theta });
+        applyState(r.state, r.full_trail || []);
+        setStatus('Đã đặt xe tại vị trí mới', 'ok');
+      } catch (e) {
+        setStatus('Lỗi đặt xe: ' + e.message, 'err');
+      }
+    });
+
+    // Keyboard events for manual mode
+    window.addEventListener('keydown', (e) => {
+      if (manualMode && ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) {
+        e.preventDefault();
+      }
+      keys[e.code] = true;
+    });
+    window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+
+    document.getElementById('btnPlay').onclick = () => {
+      manualMode = false;
+      document.getElementById('btnManual').classList.remove('active-toggle');
+      running = !running;
+      updatePlayBtn();
+      setStatus(running ? 'Đang chạy ONNX vòng kín...' : 'Tạm dừng', running ? 'ok' : 'warn');
+      if (running) simLoop();
+    };
+
+    document.getElementById('btnStep').onclick = async () => {
+      running = false;
+      updatePlayBtn();
+      const st = await api('/api/step', { move: true, steps: 1 });
+      applyState(st);
+    };
+
+    document.getElementById('btnReset').onclick = async () => {
+      running = false;
+      updatePlayBtn();
+      const r = await api('/api/reset', {});
+      applyState(r.state, r.full_trail || []);
+      setStatus('Đã đưa xe về vạch START', 'ok');
+    };
+
+    document.getElementById('btnClear').onclick = () => {
+      trail = [];
+      drawMap();
+    };
+
+    document.getElementById('s_obs_r').oninput = (e) => {
+      document.getElementById('v_obs_r').textContent = e.target.value;
+    };
+    document.getElementById('btnObsMode').onclick = () => {
+      obsPlaceMode = !obsPlaceMode;
+      document.getElementById('btnObsMode').classList.toggle('active-toggle', obsPlaceMode);
+      setStatus(obsPlaceMode ? 'CHẾ ĐỘ ĐẶT VẬT CẢN: click lên đường đen để thêm/xóa vật cản' : 'Đã tắt chế độ đặt vật cản (kéo chuột để đặt xe)', obsPlaceMode ? 'warn' : 'ok');
+    };
+    document.getElementById('btnObsPreset').onclick = async () => {
+      try {
+        const res = await api('/api/obstacles', { action: 'preset' });
+        obstacles = res.obstacles || [];
+        applyState(res.state);
+        setStatus(`Đã đặt ${obstacles.length} vật cản tĩnh mẫu — bấm CHẠY hoặc CHẠY NHANH 1 VÒNG để test né!`, 'ok');
+      } catch (e) { setStatus('Lỗi vật cản: ' + e.message, 'err'); }
+    };
+    document.getElementById('btnObsClear').onclick = async () => {
+      try {
+        const res = await api('/api/obstacles', { action: 'clear' });
+        obstacles = [];
+        applyState(res.state);
+        setStatus('Đã xóa toàn bộ vật cản', 'ok');
+      } catch (e) { setStatus('Lỗi xóa vật cản: ' + e.message, 'err'); }
+    };
+
+    document.getElementById('btnManual').onclick = () => {
+      running = false;
+      updatePlayBtn();
+      manualMode = !manualMode;
+      document.getElementById('btnManual').classList.toggle('active-toggle', manualMode);
+      setStatus(manualMode ? 'LÁI TAY: dùng WASD hoặc phím mũi tên' : 'Tắt lái tay', manualMode ? 'warn' : 'ok');
+      if (manualMode) simLoop();
+    };
+
+    document.getElementById('btnBench').onclick = async () => {
+      running = false;
+      updatePlayBtn();
+      setStatus('Đang chạy benchmark cả vòng bằng ONNX thật...', 'warn');
+      try {
+        const st = await api('/api/benchmark', { max_steps: 3200 });
+        applyState(st, st.full_trail || []);
+        const t = st.telemetry;
+        setStatus(
+          `Benchmark xong: ${t.laps_done >= 1 ? 'HOÀN THÀNH 1 VÒNG' : ('Đạt ' + t.progress_pct + '%')} | ${t.sim_time}s | Chạm vạch ${t.off_road_pct}% | Đảo đỏ ${t.in_red_pct}%`,
+          t.laps_done >= 1 && t.in_red_pct === 0 ? 'ok' : 'err'
+        );
+      } catch (e) {
+        setStatus('Lỗi benchmark: ' + e.message, 'err');
+      }
+    };
+
+    // Presets (tat ca giu CO DINH default.yaml!)
+    async function applyPreset(controller, modelPref) {
+      running = false;
+      updatePlayBtn();
+      document.getElementById('selController').value = controller;
+      if (modelPref && modelsMeta.some(m => m.name === modelPref)) {
+        document.getElementById('selModel').value = modelPref;
+      }
+      await pushConfig();
+      const r = await api('/api/reset', {});
+      applyState(r.state, r.full_trail || []);
+    }
+    document.getElementById('preOld').onclick = () => applyPreset('project_current', 'lane_option_b_resse.onnx');
+    document.getElementById('prePP').onclick = () => applyPreset('road_pure_pursuit', 'lane_road_only_fast.onnx');
+    document.getElementById('preFTG').onclick = () => applyPreset('road_ftg', 'lane_road_only_fast.onnx');
+
+    document.getElementById('selModel').onchange = pushConfig;
+    document.getElementById('selController').onchange = pushConfig;
+    for (const k of SLIDER_IDS) {
+      const el = document.getElementById('s_' + k);
+      const vl = document.getElementById('v_' + k);
+      el.oninput = () => {
+        vl.textContent = Number.isInteger(Number(el.step)) ? String(Math.round(el.value)) : Number(el.value).toFixed(2);
+      };
+      el.onchange = pushConfig;
+    }
+    for (const id of ['chkFov', 'chkBev', 'chkTrail']) {
+      document.getElementById(id).onchange = drawMap;
+    }
+
+// Presets (tat ca giu CO DINH default.yaml!)
+async function applyPreset(controller, modelPref) {
+  running = false;
+  updatePlayBtn();
+  document.getElementById('selController').value = controller;
+  updateControllerControls();
+  if (modelPref && modelsMeta.some(m => m.name === modelPref)) {
+    document.getElementById('selModel').value = modelPref;
+  }
+  await pushConfig();
+  const r = await api('/api/reset', {});
+  applyState(r.state, r.full_trail || []);
+}
+document.getElementById('preOld').onclick = () => applyPreset('project_current', 'lane_option_b_resse.onnx');
+document.getElementById('prePP').onclick = () => applyPreset('road_pure_pursuit', 'lane_road_only_fast.onnx');
+document.getElementById('preFTG').onclick = () => applyPreset('road_ftg', 'lane_road_only_fast.onnx');
+document.getElementById('btnResetDefaults').onclick = async () => {
+  if (!fixedDefault) return;
+  syncSlidersFromParams({
+    v_straight: fixedDefault.v_straight,
+    v_corner: fixedDefault.v_corner,
+    servo_limit: fixedDefault.steering_output_max,
+    pp_lookahead_px: 84,
+    pp_gain: 1.15,
+    ftg_gain: 1.25,
+    ftg_bubble: 5,
+  });
+  await pushConfig();
+  setStatus('Đã đưa tốc độ & servo về mặc định configs/default.yaml', 'ok');
+};
+
+document.getElementById('selModel').onchange = pushConfig;
+document.getElementById('selController').onchange = () => { updateControllerControls(); pushConfig(); };
+for (const k of SLIDER_IDS) {
+  const el = document.getElementById('s_' + k);
+  const vl = document.getElementById('v_' + k);
+  el.oninput = () => {
+    vl.textContent = Number.isInteger(Number(el.step)) ? String(Math.round(el.value)) : Number(el.value).toFixed(2);
+  };
+  el.onchange = pushConfig;
+}
+for (const id of ['chkFov', 'chkBev', 'chkTrail']) {
+  document.getElementById(id).onchange = drawMap;
+}
+
+// Init
+async function init() {
+  mapImg.onload = () => { mapLoaded = true; drawMap(); };
+  mapImg.src = '/api/map.jpg';
+  const info = await api('/api/info');
+  modelsMeta = info.models || [];
+  fixedDefault = info.fixed_default || null;
+  if (fixedDefault) {
+    const f = fixedDefault;
+    document.getElementById('fixedStrip').innerHTML =
+      `🔒 <b>CỐ ĐỊNH từ configs/default.yaml:</b> ` +
+      `servo=[${f.steering_output_min.toFixed(2)}, +${f.steering_output_max.toFixed(2)}] ` +
+      `(PWM ${f.pulse_width_range[0]}–${f.pulse_width_range[1]}µs) | ` +
+      `steer_gain=${f.steering_gain} | thr_gain=${f.throttle_gain} | ` +
+      `v_straight=${f.v_straight} | v_corner=${f.v_corner} | ${f.control_hz}Hz`;
+  }
+  const sel = document.getElementById('selModel');
+  sel.innerHTML = '';
+  for (const m of modelsMeta) {
+    const opt = document.createElement('option');
+    opt.value = m.name;
+    opt.textContent = `${m.label} — ${m.nano_fps}`;
+    sel.appendChild(opt);
+  }
+  sel.value = info.model;
+  document.getElementById('selController').value = info.controller;
+  updateControllerControls();
+  syncSlidersFromParams(info.params || {});
+  updateNanoHint();
+  applyState(info.state, info.full_trail || []);
+  setStatus('Sẵn sàng — bấm CHẠY hoặc CHẠY NHANH 1 VÒNG', 'ok');
+}
+init().catch(e => setStatus('Lỗi khởi tạo: ' + e.message, 'err'));
+</script>
+</body>
+</html>

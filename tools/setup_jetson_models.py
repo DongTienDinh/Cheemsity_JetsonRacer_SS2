@@ -29,20 +29,32 @@ TRTEXEC_CANDIDATES = [
 ]
 
 MODELS = {
+    'road_fast': {
+        'label': 'KHUYEN DUNG: LaneRoadOnly-Fast (1 kenh Ch0, 0 reg_head, 53K params, 30+ FPS Nano)',
+        'onnx': 'models/lane_road_only_fast.onnx',
+        'engine': 'models/lane_road_only_fast.engine',
+        'config': 'configs/road_pure_pursuit.yaml',
+    },
+    'road_resse': {
+        'label': 'DU PHONG: LaneRoadOnly-ResSE (1 kenh Ch0, 0 reg_head, 25-30 FPS Nano)',
+        'onnx': 'models/lane_road_only_resse.onnx',
+        'engine': 'models/lane_road_only_resse.engine',
+        'config': 'configs/road_pure_pursuit_resse.yaml',
+    },
     'fast': {
-        'label': 'Option B #1: LaneTiny-Fast (uu tien toc do >= 25 FPS, 56K params, 0 SE)',
+        'label': 'Option B #1: LaneTiny-Fast (3 kenh, 56K params, 0 SE)',
         'onnx': 'models/lane_option_b_fast.onnx',
         'engine': 'models/lane_option_b_fast.engine',
         'config': 'configs/cnn_option_b_fast.yaml',
     },
     'resse': {
-        'label': 'Option B #4: LaneTiny-ResSE (can bang, 157K params)',
+        'label': 'Option B #4: LaneTiny-ResSE (3 kenh, 157K params)',
         'onnx': 'models/lane_option_b_resse.onnx',
         'engine': 'models/lane_option_b_resse.engine',
         'config': 'configs/cnn_option_b.yaml',
     },
     'fastscnn': {
-        'label': 'Option B #5: FastSCNN-Lane (du phong / A-B test, 331K params)',
+        'label': 'Option B #5: FastSCNN-Lane (3 kenh, 331K params)',
         'onnx': 'models/lane_option_b_fastscnn.onnx',
         'engine': 'models/lane_option_b_fastscnn.engine',
         'config': 'configs/cnn_option_b_fastscnn.yaml',
@@ -158,7 +170,7 @@ def verify_engine(config_rel):
 def main():
     ap = argparse.ArgumentParser(
         description='Kiem tra Jetson Nano va build TensorRT FP16 engine cho Option B.')
-    ap.add_argument('--model', choices=['all', 'fast', 'resse', 'fastscnn'],
+    ap.add_argument('--model', choices=['all', 'road_fast', 'road_resse', 'fast', 'resse', 'fastscnn'],
                     default='all', help='Chon model de build (mac dinh: all)')
     ap.add_argument('--workspace', type=int, default=256,
                     help='Bo nho workspace TensorRT (MB, mac dinh: 256)')
@@ -173,7 +185,7 @@ def main():
     print('\n=== BUOC 2: KIEM TRA TRTEXEC & FILE ONNX ===')
     print('trtexec:', trtexec if trtexec else 'KHONG TIM THAY (/usr/src/tensorrt/bin/trtexec)')
 
-    selected = ['fast', 'resse', 'fastscnn'] if args.model == 'all' else [args.model]
+    selected = ['road_fast', 'road_resse', 'fast', 'resse', 'fastscnn'] if args.model == 'all' else [args.model]
     for key in selected:
         info = MODELS[key]
         onnx_path = os.path.join(ROOT, info['onnx'])
